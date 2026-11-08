@@ -36,6 +36,21 @@ for c in CASES
             rf.attrib["cold_smb_n_outer"], rf.attrib["warm_smb_t"], rf.attrib["cold_smb_t"])
     close(rj); close(rf)
 end
+# mode "surface" (Fortran only): time and difference to flat / full
+println(io, "\n| case | surface t [s] | flat t [s] | full t [s] | surface-flat rms / max [m] | surface-full rms / max [m] |")
+println(io, "|---|---|---|---|---|---|")
+for c in CASES
+    mask = NCDataset(joinpath(OUT, "in_$c.nc")) do ds
+        Array(ds["mask"][:, :]) .== 1
+    end
+    NCDataset(joinpath(OUT, "fortran_$c.nc")) do rf
+        Hs = Array(rf["H_surface"][:, :])
+        st(H) = (d = (Hs .- H)[mask]; (sqrt(sum(abs2, d) / length(d)), d[argmax(abs.(d))]))
+        a = st(Array(rf["H_flat"][:, :])); b = st(Array(rf["H_full"][:, :]))
+        @printf(io, "| %s | %.4f | %.4f | %.4f | %.1f / %.1f | %.1f / %.1f |\n", c, rf.attrib["t_surface"],
+                rf.attrib["t_flat"], rf.attrib["t_full"], a..., b...)
+    end
+end
 s = String(take!(io))
 print(s)
 write(joinpath(OUT, "compare.md"), s)

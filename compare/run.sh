@@ -17,7 +17,7 @@ JULIA=${JULIA:-$HOME/.juliaup/bin/julia}
 JULIA_PKG=${JULIA_PKG:-/work/ba1442/robinson/PlasticIceSheet-fortran/julia-ref/PlasticIceSheet.jl}
 OUT=compare/out
 ENV_DIR=$OUT/env
-CASES="synth150 synth300 grl32"
+CASES="synth150 synth300 grl32 nh32_20ka nh32_0ka"
 
 mkdir -p $OUT
 if [ ! -f $ENV_DIR/Manifest.toml ]; then

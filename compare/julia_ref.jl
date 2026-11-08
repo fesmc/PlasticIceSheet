@@ -69,6 +69,28 @@ function greenland()
             relax_full = 0.4, n_outer_full = 500, do_smb = true)
 end
 
+# NH-32KM (FesmData): GEBCO2026 bed, mask from PaleoMIST H_ice > 0 at `ka` thousand
+# years ago, uniform tau_b = 1e5 Pa, sea level 0. Flat and full only (no SMB).
+function north(ka)
+    dir = get(ENV, "NH_DIR", "/work/ba1442/fesmdata/North/NH-32KM")
+    topo = joinpath(dir, "NH-32KM_TOPO-GEBCO2026.nc")
+    hist = joinpath(dir, "NH-32KM_IceHistory-PaleoMIST.nc")
+    xc, yc, z_b = NCDataset(topo) do ds
+        (Array{Float64}(ds["xc"][:]), Array{Float64}(ds["yc"][:]),
+         Float64.(coalesce.(ds["z_bed"][:, :], 0.0)))
+    end
+    H = NCDataset(hist) do ds
+        k = findfirst(==(1000.0 * ka), Array{Float64}(ds["time"][:]))
+        Float64.(coalesce.(ds["H_ice"][:, :, k], 0.0))
+    end
+    nx, ny = size(z_b)
+    dx = abs(xc[2] - xc[1]) * 1000.0
+    return (; z_b, z_sl = zeros(nx, ny), tau = fill(1.0e5, nx, ny), mask = H .> 0.0,
+            smb = zeros(nx, ny), dx, dy = dx, x = xc .* 1000.0, y = yc .* 1000.0,
+            rheo = GlenRheology(A = 1.0e-16, n = 3.0), slide = WeertmanSliding(β = 1.0e4, m = 3.0),
+            law = "weertman", relax_full = 0.4, n_outer_full = 500, do_smb = false)
+end
+
 slide_params(s::WeertmanSliding) = (s.β, s.m, 0.0, 0.0)
 slide_params(s::RegularizedCoulomb) = (0.0, s.m, s.C, s.u_0)
 
@@ -141,4 +163,6 @@ end
 run_case("synth150", synthetic(150))
 run_case("synth300", synthetic(300))
 run_case("grl32", greenland())
+run_case("nh32_20ka", north(20))
+run_case("nh32_0ka", north(0))
 println("julia_ref: done -> $OUT")
