@@ -97,13 +97,15 @@ contains
     ! integrates the margin singularity exactly on a flat bed (it reproduces the Nye
     ! profile, like the flat w = H^2 update); a cell-centred k/H would put the first
     ! cell at sqrt(k dx) instead of sqrt(2 k dx). Where both neighbours stand above zb
-    ! this is the w-eikonal with w_a = alpha^2 and F = 2k (closed form); otherwise the
+    ! this is the w-eikonal with w_a = alpha^2 and F = 2k (closed form, for the increment
+    ! over the smaller w_a to avoid cancellation); otherwise the
     ! two-sided root is found by Newton from the smaller one-sided root (P^2 is convex
     ! and increasing there, so Newton decreases monotonically to the root).
     pure function godunov_surface(a, da, b, db, zb, k) result(u)
         real(dp), intent(in) :: a, da, b, db, zb, k
         real(dp) :: u
-        real(dp) :: al, be, wa, wb, hA, hB, h0, other, h, pa, pb, dpa, dpb, phi, dphi, dh
+        real(dp) :: al, be, wa, wb, wm, dm, dother, c, dw, qa
+        real(dp) :: hA, hB, h0, other, h, pa, pb, dpa, dpb, phi, dphi, dh
         integer  :: it
 
         if (a >= BIG .and. b >= BIG) then
@@ -120,13 +122,30 @@ contains
         if (a < BIG) al = a - zb
         if (b < BIG) be = b - zb
 
-        ! Both neighbour surfaces at or above this bed: the w-eikonal in closed form.
+        ! Both neighbour surfaces at or above this bed: the w-eikonal (w = H^2, F = 2k)
+        ! in closed form, solved for the increment over the smaller neighbour w
+        ! (well-conditioned: no cancellation against w itself).
         if (al >= 0.0_dp .and. be >= 0.0_dp) then
-            wa = BIG
-            wb = BIG
-            if (a < BIG) wa = al * al
-            if (b < BIG) wb = be * be
-            u = zb + sqrt(godunov_eikonal(wa, da, wb, db, 2.0_dp * k))
+            if (a >= BIG) then
+                u = zb + sqrt(be * be + 2.0_dp * k * db)
+            else if (b >= BIG) then
+                u = zb + sqrt(al * al + 2.0_dp * k * da)
+            else
+                wa = al * al
+                wb = be * be
+                if (wa <= wb) then
+                    wm = wa; dm = da; c = wb - wa; dother = db
+                else
+                    wm = wb; dm = db; c = wa - wb; dother = da
+                end if
+                dw = 2.0_dp * k * dm                      ! one-sided in the smaller neighbour
+                if (dw > c) then                          ! both axes upwind: two-sided root in (c, dw)
+                    qa = 1.0_dp / (dm * dm) + 1.0_dp / (dother * dother)
+                    dw = (c / (dother * dother) + sqrt(max(qa * (2.0_dp * k)**2 &
+                          - (c / (dm * dother))**2, 0.0_dp))) / qa
+                end if
+                u = zb + sqrt(wm + dw)
+            end if
             return
         end if
 

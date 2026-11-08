@@ -39,7 +39,8 @@ contains
     ! Random inputs (neighbours above and below the bed, dx /= dy): the update solves
     ! its equation, lies above the bed, and is nondecreasing in a and b (monotone).
     subroutine test_kernel()
-        integer  :: n, nbad_eq, nbad_mono, nbad_bed
+        integer  :: n, nbad_eq, nbad_mono, nbad_bed, nseed
+        integer, allocatable :: seed(:)
         real(dp) :: r(6), a, b, zb, k, da, db, u, u2, emax, kk
         write(*, '(a)') "surface kernel"
         kk = 1.0e5_dp / rho_g
@@ -47,7 +48,10 @@ contains
                          sqrt(2.0_dp * kk * 1000.0_dp), 1.0e-14_dp, 0.0_dp, &
                          "flat-bed margin cell: H = sqrt(2 k dx) (Nye)")
         call check(godunov_surface(BIG, 1.0_dp, BIG, 1.0_dp, 0.0_dp, kk) >= BIG, "no upwind information -> BIG")
-        call random_seed()
+        call random_seed(size=nseed)
+        allocate(seed(nseed))
+        seed = 12345
+        call random_seed(put=seed)
         nbad_eq = 0; nbad_mono = 0; nbad_bed = 0; emax = 0.0_dp
         do n = 1, 200000
             call random_number(r)
@@ -60,7 +64,7 @@ contains
             u = godunov_surface(a, da, b, db, zb, k)
             if (.not. (u > zb)) nbad_bed = nbad_bed + 1
             emax = max(emax, abs(surface_eq(u, a, da, b, db, zb, k)))
-            if (abs(surface_eq(u, a, da, b, db, zb, k)) > 1.0e-9_dp) nbad_eq = nbad_eq + 1
+            if (abs(surface_eq(u, a, da, b, db, zb, k)) > 1.0e-10_dp) nbad_eq = nbad_eq + 1
             u2 = godunov_surface(a + 1.0_dp, da, b, db, zb, k)
             if (u2 < u - 1.0e-9_dp * abs(u)) nbad_mono = nbad_mono + 1
             u2 = godunov_surface(a, da, b + 1.0_dp, db, zb, k)
