@@ -1,0 +1,19 @@
+# Machine/compiler fragment: DKRZ Levante, Intel ifx (the kryos production compiler).
+# Levante compute nodes are AMD EPYC 7763 (Zen3): AVX2, no AVX-512.
+
+FC = ifx
+
+FFLAGS = -no-wrap-margin -module $(objdir) -I$(objdir)
+FFLAGS_OPENMP = -qopenmp
+
+# -fp-model precise: the library tests NaN (RegularizedCoulomb at its cap) and must
+# not have IEEE semantics optimised away.
+DFLAGS_NODEBUG = -O3 -march=core-avx2 -fp-model precise -traceback
+DFLAGS_DEBUG   = -C -O0 -g -traceback -ftrapuv -fpe0 -check all,nouninit -fp-model precise -debug extended -warn interfaces
+DFLAGS_PROFILE = -O2 -fp-model precise -pg
+
+# Only for the comparison driver (make compare): fesm-utils ncio + netCDF.
+FESMUTILSROOT ?= /work/ba1442/robinson/models/fesm-utils
+NC_FROOT = /sw/spack-levante/netcdf-fortran-4.6.2-tjqnse
+NC_CROOT = /sw/spack-levante/netcdf-c-4.9.3-swwckb
+LIB_NC = -L$(NC_FROOT)/lib -lnetcdff -L$(NC_CROOT)/lib -lnetcdf -Wl,-rpath,$(NC_FROOT)/lib -Wl,-rpath,$(NC_CROOT)/lib

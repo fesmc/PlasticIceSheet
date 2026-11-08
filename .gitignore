@@ -1,0 +1,10 @@
+.DS_Store
+*.x
+*.o
+*.mod
+*.a
+libplastic/include/*
+libplastic/bin/*
+!libplastic/include/.gitkeep
+!libplastic/bin/.gitkeep
+compare/out/
