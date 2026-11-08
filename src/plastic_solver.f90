@@ -30,6 +30,11 @@ module plastic_solver
         real(dp), allocatable :: bc(:,:)    ! margin values H_flt^2
         real(dp), allocatable :: zbx(:,:), zby(:,:)   ! bed gradient
         logical,  allocatable :: mask_prev(:,:)       ! mask of the stored solution
+        ! closures (plastic_flow, plastic_reconstruct)
+        real(dp), allocatable :: ex(:,:), ey(:,:)     ! unit flow direction
+        real(dp), allocatable :: f1(:,:), f2(:,:)     ! scratch: flux, inflow / driving stress
+        integer,  allocatable :: idx(:), ti(:)        ! balance-flux ordering (nx*ny)
+        real(dp), allocatable :: key(:), tk(:)
     end type plastic_work_t
 
     type plastic_t
@@ -84,6 +89,8 @@ contains
         allocate(ps%wk%G(nx, ny), ps%wk%F(nx, ny), ps%wk%wc(nx, ny), ps%wk%bc(nx, ny))
         allocate(ps%wk%zbx(nx, ny), ps%wk%zby(nx, ny), ps%wk%mask_prev(nx, ny))
         ps%wk%mask_prev = .false.
+        allocate(ps%wk%ex(nx, ny), ps%wk%ey(nx, ny), ps%wk%f1(nx, ny), ps%wk%f2(nx, ny))
+        allocate(ps%wk%idx(nx*ny), ps%wk%ti(nx*ny), ps%wk%key(nx*ny), ps%wk%tk(nx*ny))
 
         ps%has_warm = .false.
         ps%stat = PLASTIC_OK
@@ -110,6 +117,14 @@ contains
         if (allocated(ps%wk%zbx))       deallocate(ps%wk%zbx)
         if (allocated(ps%wk%zby))       deallocate(ps%wk%zby)
         if (allocated(ps%wk%mask_prev)) deallocate(ps%wk%mask_prev)
+        if (allocated(ps%wk%ex))        deallocate(ps%wk%ex)
+        if (allocated(ps%wk%ey))        deallocate(ps%wk%ey)
+        if (allocated(ps%wk%f1))        deallocate(ps%wk%f1)
+        if (allocated(ps%wk%f2))        deallocate(ps%wk%f2)
+        if (allocated(ps%wk%idx))       deallocate(ps%wk%idx)
+        if (allocated(ps%wk%ti))        deallocate(ps%wk%ti)
+        if (allocated(ps%wk%key))       deallocate(ps%wk%key)
+        if (allocated(ps%wk%tk))        deallocate(ps%wk%tk)
         ps%nx = 0
         ps%ny = 0
         ps%has_warm = .false.

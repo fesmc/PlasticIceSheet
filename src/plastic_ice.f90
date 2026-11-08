@@ -11,6 +11,13 @@ module plastic_ice
                                plastic_end, plastic_volume, plastic_area, &
                                plastic_surface_misfit, plastic_residual, &
                                PLASTIC_OK, PLASTIC_NOT_CONVERGED, PLASTIC_BAD_INPUT
+    use plastic_flow,    only: plastic_glen_t, plastic_sliding_t, &
+                               plastic_deformational_velocity, plastic_basal_velocity, &
+                               plastic_flow_direction, plastic_velocity, plastic_smb_implied, &
+                               plastic_balance_flux, plastic_balance_velocity, &
+                               plastic_implied_basal_velocity
+    use plastic_reconstruct, only: plastic_smb_ctrl_t, plastic_solve_smb, &
+                                   plastic_invert_driving_stress
 
     implicit none
 
@@ -21,5 +28,11 @@ module plastic_ice
     public :: plastic_flotation_thickness
     public :: plastic_volume, plastic_area, plastic_surface_misfit, plastic_residual
     public :: PLASTIC_OK, PLASTIC_NOT_CONVERGED, PLASTIC_BAD_INPUT
+    ! closures
+    public :: plastic_glen_t, plastic_sliding_t
+    public :: plastic_deformational_velocity, plastic_basal_velocity
+    public :: plastic_flow_direction, plastic_velocity, plastic_smb_implied
+    public :: plastic_balance_flux, plastic_balance_velocity, plastic_implied_basal_velocity
+    public :: plastic_smb_ctrl_t, plastic_solve_smb, plastic_invert_driving_stress
 
 end module plastic_ice

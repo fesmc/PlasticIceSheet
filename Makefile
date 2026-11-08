@@ -39,6 +39,8 @@ endif
 plastic_objs = $(objdir)/plastic_kinds.o \
                $(objdir)/plastic_eikonal.o \
                $(objdir)/plastic_solver.o \
+               $(objdir)/plastic_flow.o \
+               $(objdir)/plastic_reconstruct.o \
                $(objdir)/plastic_ice.o
 
 $(objdir)/plastic_kinds.o: $(srcdir)/plastic_kinds.f90
@@ -50,7 +52,13 @@ $(objdir)/plastic_eikonal.o: $(srcdir)/plastic_eikonal.f90 $(objdir)/plastic_kin
 $(objdir)/plastic_solver.o: $(srcdir)/plastic_solver.f90 $(objdir)/plastic_eikonal.o
 	$(FC) $(DFLAGS) $(FFLAGS) -c -o $@ $<
 
-$(objdir)/plastic_ice.o: $(srcdir)/plastic_ice.f90 $(objdir)/plastic_solver.o
+$(objdir)/plastic_flow.o: $(srcdir)/plastic_flow.f90 $(objdir)/plastic_solver.o
+	$(FC) $(DFLAGS) $(FFLAGS) -c -o $@ $<
+
+$(objdir)/plastic_reconstruct.o: $(srcdir)/plastic_reconstruct.f90 $(objdir)/plastic_flow.o
+	$(FC) $(DFLAGS) $(FFLAGS) -c -o $@ $<
+
+$(objdir)/plastic_ice.o: $(srcdir)/plastic_ice.f90 $(objdir)/plastic_reconstruct.o
 	$(FC) $(DFLAGS) $(FFLAGS) -c -o $@ $<
 
 ###############################################
@@ -78,4 +86,4 @@ $(objdir)/libplastic.a: $(plastic_objs)
 	@echo " "
 
 clean:
-	rm -f $(objdir)/*.o $(objdir)/*.mod $(objdir)/*.a $(bindir)/*.x
+	rm -f $(objdir)/*.o $(objdir)/*.mod $(objdir)/*.a $(objdir)/*.smod $(bindir)/*.x
