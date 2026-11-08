@@ -65,11 +65,12 @@ $(objdir)/plastic_ice.o: $(srcdir)/plastic_ice.f90 $(objdir)/plastic_reconstruct
 ## Targets
 ###############################################
 
-.PHONY: usage all static test check clean
+.PHONY: usage all static test check compare clean
 
 usage:
 	@echo "make static [config=<machine>_<compiler>]   -> $(objdir)/libplastic.a + .mod files"
 	@echo "make check  [config=...]                    -> build and run the tests"
+	@echo "make compare                                -> comparison driver (fesm-utils ncio)"
 	@echo "make clean"
 	@echo "configs: $(notdir $(filter-out config/common.mk,$(wildcard config/*)))"
 
@@ -102,6 +103,11 @@ check: test
 		$(bindir)/$$t.x || { echo "FAILED: $$t"; exit 1; }; \
 	done
 	@echo "make check: all tests passed (FC=$(FC))"
+
+# Comparison driver with PlasticIceSheet.jl (compare/run.sh); needs fesm-utils ncio.
+compare: $(objdir)/libplastic.a
+	$(FC) $(DFLAGS) $(FFLAGS) $(INC_FESMUTILS) -o $(bindir)/plastic_compare.x compare/plastic_compare.f90 \
+		-L$(objdir) -lplastic $(LIB_FESMUTILS) $(LIB_NC) $(LFLAGS)
 
 clean:
 	rm -f $(objdir)/*.o $(objdir)/*.mod $(objdir)/*.a $(objdir)/*.smod $(bindir)/*.x
