@@ -1,6 +1,7 @@
 ! Numerical core of the perfectly-plastic reconstruction: the Godunov update of the
 ! static eikonal |grad u| = F, fast sweeping, the right-hand side of the w = H^2
-! equation in :flat and :full mode, and the Godunov residual.
+! equation in :flat and :full mode, the Godunov update of the surface equation
+! (mode "surface"), and the Godunov residuals.
 !
 ! All routines are pure array kernels on explicit-shape (nx,ny) arrays, i = x, j = y.
 ! They carry no state, so several solver instances can run concurrently.
@@ -13,11 +14,11 @@ module plastic_eikonal
     private
     public :: plastic_par_t
     public :: plastic_flotation_thickness
-    public :: godunov_eikonal
-    public :: sweep_once, sweep_eikonal
+    public :: godunov_eikonal, godunov_surface
+    public :: sweep_once, sweep_once_surface, sweep_eikonal
     public :: grad_central
     public :: flotation_bc, rhs_flat, rhs_full
-    public :: godunov_residual
+    public :: godunov_residual, godunov_residual_surface
 
     ! Physical constants and solver controls.
     type plastic_par_t
@@ -25,10 +26,10 @@ module plastic_eikonal
         real(dp) :: rho_w  = 1025.0_dp      ! sea-water density [kg m-3]
         real(dp) :: g      = 9.80665_dp     ! gravity [m s-2]
         real(dp) :: H_min  = 1.0_dp         ! thickness floor in the :full RHS [m]
-        character(len=8) :: mode = "full"   ! "full" | "flat"
+        character(len=8) :: mode = "full"   ! "full" | "flat" | "surface"
         integer  :: max_sweeps = 200        ! inner fast-sweeping cap
         integer  :: n_outer    = 100        ! :full outer fixed-point cap
-        real(dp) :: tol        = 1.0e-6_dp  ! inner early exit, on max decrease of w [m2]
+        real(dp) :: tol        = 1.0e-6_dp  ! inner early exit, on max decrease of w [m2] (z_s [m] in "surface")
         real(dp) :: outer_tol  = 1.0e-3_dp  ! :full outer exit, on max change of H [m]
         real(dp) :: relax      = 0.5_dp     ! :full under-relaxation in (0,1]
         ! Warm start: fall back to a cold start when more than this fraction of the
@@ -81,6 +82,102 @@ contains
         u = min(a + F * da, b + F * db)
     end function godunov_eikonal
 
+    ! Godunov update of the plastic surface equation |grad z_s| = k / H, H = z_s - zb,
+    ! k = tau_b / (rho_i g), for the surface u = z_s of a cell with bed zb, from the
+    ! upwind (smaller) neighbour surfaces a (x, spacing da) and b (y, spacing db).
+    !
+    ! Each axis contributes the difference (u - a)+ times the edge-mean thickness
+    ! (H + (a - zb)+)/2, with the neighbour thickness measured from this cell's bed:
+    !
+    !   P_a(H) = (H - alpha)+ (H + alpha+) / 2,  alpha = a - zb,
+    !   (P_a/da)^2 + (P_b/db)^2 = k^2.
+    !
+    ! P_a is increasing in H (so the Hamiltonian is proper) and nonincreasing in a
+    ! (monotone scheme): fast sweeping applies, with no outer iteration. The edge mean
+    ! integrates the margin singularity exactly on a flat bed (it reproduces the Nye
+    ! profile, like the flat w = H^2 update); a cell-centred k/H would put the first
+    ! cell at sqrt(k dx) instead of sqrt(2 k dx). Where both neighbours stand above zb
+    ! this is the w-eikonal with w_a = alpha^2 and F = 2k (closed form); otherwise the
+    ! two-sided root is found by Newton from the smaller one-sided root (P^2 is convex
+    ! and increasing there, so Newton decreases monotonically to the root).
+    pure function godunov_surface(a, da, b, db, zb, k) result(u)
+        real(dp), intent(in) :: a, da, b, db, zb, k
+        real(dp) :: u
+        real(dp) :: al, be, wa, wb, hA, hB, h0, other, h, pa, pb, dpa, dpb, phi, dphi, dh
+        integer  :: it
+
+        if (a >= BIG .and. b >= BIG) then
+            u = BIG
+            return
+        end if
+        if (.not. (k > 0.0_dp)) then
+            u = max(zb, min(a, b))
+            return
+        end if
+
+        al = 0.0_dp
+        be = 0.0_dp
+        if (a < BIG) al = a - zb
+        if (b < BIG) be = b - zb
+
+        ! Both neighbour surfaces at or above this bed: the w-eikonal in closed form.
+        if (al >= 0.0_dp .and. be >= 0.0_dp) then
+            wa = BIG
+            wb = BIG
+            if (a < BIG) wa = al * al
+            if (b < BIG) wb = be * be
+            u = zb + sqrt(godunov_eikonal(wa, da, wb, db, 2.0_dp * k))
+            return
+        end if
+
+        ! One-sided roots P(H) = k d; the smaller one bounds the two-sided root.
+        hA = BIG
+        hB = BIG
+        if (a < BIG) hA = one_sided(al, k * da)
+        if (b < BIG) hB = one_sided(be, k * db)
+        if (hA <= hB) then
+            h0 = hA
+            other = b
+        else
+            h0 = hB
+            other = a
+        end if
+        if (other >= BIG .or. zb + h0 <= other) then
+            u = zb + h0
+            return
+        end if
+
+        ! Two-sided: Newton on phi(H) = (P_a/da)^2 + (P_b/db)^2 - k^2 from H = h0.
+        h = h0
+        do it = 1, 60
+            pa  = (h - al) * (h + max(al, 0.0_dp)) / 2.0_dp
+            pb  = (h - be) * (h + max(be, 0.0_dp)) / 2.0_dp
+            dpa = (2.0_dp * h + max(al, 0.0_dp) - al) / 2.0_dp
+            dpb = (2.0_dp * h + max(be, 0.0_dp) - be) / 2.0_dp
+            phi  = (pa / da)**2 + (pb / db)**2 - k * k
+            dphi = 2.0_dp * (pa * dpa / (da * da) + pb * dpb / (db * db))
+            if (.not. (phi > 0.0_dp .and. dphi > 0.0_dp)) exit
+            dh = phi / dphi
+            h  = h - dh
+            if (dh <= 1.0e-14_dp * h) exit
+        end do
+        u = zb + h
+
+    contains
+
+        ! Root H > 0 of (H - al)(H + al+)/2 = kd.
+        pure function one_sided(al, kd) result(hh)
+            real(dp), intent(in) :: al, kd
+            real(dp) :: hh
+            if (al >= 0.0_dp) then
+                hh = sqrt(al * al + 2.0_dp * kd)
+            else
+                hh = 4.0_dp * kd / (sqrt(al * al + 8.0_dp * kd) - al)
+            end if
+        end function one_sided
+
+    end function godunov_surface
+
     ! One Gauss-Seidel sweep in the ordering (xdir, ydir) = (+-1, +-1). Updates ice
     ! cells only, keeps the monotone min, and returns the largest decrease of u.
     ! Cells outside the array are clamped to the edge.
@@ -125,11 +222,55 @@ contains
         end do
     end function sweep_once
 
+    ! sweep_once for the surface equation: u = z_s, K = tau_b/(rho_i g), zb the bed.
+    function sweep_once_surface(nx, ny, u, K, zb, mask, dx, dy, xdir, ydir) result(change)
+        integer,  intent(in)    :: nx, ny
+        real(dp), intent(inout) :: u(nx, ny)
+        real(dp), intent(in)    :: K(nx, ny), zb(nx, ny)
+        logical,  intent(in)    :: mask(nx, ny)
+        real(dp), intent(in)    :: dx, dy
+        integer,  intent(in)    :: xdir, ydir
+        real(dp) :: change
+        integer  :: i, j, i0, i1, j0, j1, im, ip, jm, jp
+        real(dp) :: a, b, unew
+
+        if (xdir > 0) then
+            i0 = 1;  i1 = nx
+        else
+            i0 = nx; i1 = 1
+        end if
+        if (ydir > 0) then
+            j0 = 1;  j1 = ny
+        else
+            j0 = ny; j1 = 1
+        end if
+
+        change = 0.0_dp
+        do j = j0, j1, ydir
+            jm = max(j - 1, 1)
+            jp = min(j + 1, ny)
+            do i = i0, i1, xdir
+                if (.not. mask(i, j)) cycle
+                im = max(i - 1, 1)
+                ip = min(i + 1, nx)
+                a = min(u(im, j), u(ip, j))
+                b = min(u(i, jm), u(i, jp))
+                unew = godunov_surface(a, dx, b, dy, zb(i, j), K(i, j))
+                if (unew < u(i, j)) then
+                    change  = max(change, u(i, j) - unew)
+                    u(i, j) = unew
+                end if
+            end do
+        end do
+    end function sweep_once_surface
+
     ! Solve |grad u| = F on the ice cells (mask), with Dirichlet values bc on the
     ! ice-free cells. u starts from BIG on ice cells (the monotone scheme only
     ! decreases u). The four diagonal orderings alternate; the early exit needs a
     ! full cycle of four. Returns the number of sweeps and whether tol was reached.
-    subroutine sweep_eikonal(nx, ny, u, F, mask, bc, dx, dy, max_sweeps, tol, n_sweeps, ok)
+    ! With zb present, solves the surface equation instead (u = z_s, F = tau_b/(rho_i g),
+    ! see godunov_surface).
+    subroutine sweep_eikonal(nx, ny, u, F, mask, bc, dx, dy, max_sweeps, tol, n_sweeps, ok, zb)
         integer,  intent(in)  :: nx, ny
         real(dp), intent(out) :: u(nx, ny)
         real(dp), intent(in)  :: F(nx, ny), bc(nx, ny)
@@ -138,6 +279,7 @@ contains
         integer,  intent(in)  :: max_sweeps
         integer,  intent(out) :: n_sweeps
         logical,  intent(out) :: ok
+        real(dp), optional, intent(in) :: zb(nx, ny)
         integer, parameter :: xd(4) = [1, -1, -1, 1]
         integer, parameter :: yd(4) = [1, 1, -1, -1]
         integer  :: i, j, s, k
@@ -157,7 +299,11 @@ contains
         n_sweeps = 0
         do s = 1, max_sweeps
             k = mod(s - 1, 4) + 1
-            change = sweep_once(nx, ny, u, F, mask, dx, dy, xd(k), yd(k))
+            if (present(zb)) then
+                change = sweep_once_surface(nx, ny, u, F, zb, mask, dx, dy, xd(k), yd(k))
+            else
+                change = sweep_once(nx, ny, u, F, mask, dx, dy, xd(k), yd(k))
+            end if
             n_sweeps = s
             if (s >= 4 .and. change < tol) then
                 ok = .true.
@@ -291,5 +437,32 @@ contains
             end do
         end do
     end subroutine godunov_residual
+
+    ! Godunov residual of the surface equation: u - (surface update) on ice cells,
+    ! u - bc on ice-free cells (u = z_s, K = tau_b/(rho_i g), bc = z_b + H_flt).
+    subroutine godunov_residual_surface(nx, ny, u, K, zb, mask, bc, dx, dy, r)
+        integer,  intent(in)  :: nx, ny
+        real(dp), intent(in)  :: u(nx, ny), K(nx, ny), zb(nx, ny), bc(nx, ny), dx, dy
+        logical,  intent(in)  :: mask(nx, ny)
+        real(dp), intent(out) :: r(nx, ny)
+        integer  :: i, j, im, ip, jm, jp
+        real(dp) :: a, b
+
+        do j = 1, ny
+            jm = max(j - 1, 1)
+            jp = min(j + 1, ny)
+            do i = 1, nx
+                if (mask(i, j)) then
+                    im = max(i - 1, 1)
+                    ip = min(i + 1, nx)
+                    a = min(u(im, j), u(ip, j))
+                    b = min(u(i, jm), u(i, jp))
+                    r(i, j) = u(i, j) - godunov_surface(a, dx, b, dy, zb(i, j), K(i, j))
+                else
+                    r(i, j) = u(i, j) - bc(i, j)
+                end if
+            end do
+        end do
+    end subroutine godunov_residual_surface
 
 end module plastic_eikonal

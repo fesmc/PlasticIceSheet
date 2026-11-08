@@ -14,6 +14,7 @@ module plastic_solver
     public :: plastic_t, plastic_work_t
     public :: plastic_init, plastic_solve, plastic_reset, plastic_end
     public :: plastic_volume, plastic_area, plastic_surface_misfit, plastic_residual
+    public :: plastic_stress_residual
     public :: PLASTIC_OK, PLASTIC_NOT_CONVERGED, PLASTIC_BAD_INPUT
     public :: check_shape, cold_flat_solve, finalize_geometry, warm_start_cells
 
@@ -138,6 +139,9 @@ contains
     ! mode "flat": one eikonal solve |grad w| = 2 tau_b/(rho_i g).
     ! mode "full": damped fixed point on the bed-corrected RHS, started from the flat
     ! solution (cold) or from the stored w of the last solve (warm=.true.).
+    ! mode "surface": one fast-sweeping solve of the surface equation
+    ! |grad z_s| = tau_b / (rho_i g (z_s - z_bed)) for z_s itself (godunov_surface):
+    ! full bed relief, no outer iteration; warm has no effect. Not in PlasticIceSheet.jl.
     !
     ! Warm start (full mode only; a flat solve is a single sweep from +BIG either way):
     ! ice cells that were also ice in the stored solution keep their stored w; ice-free
@@ -164,6 +168,11 @@ contains
         if (ps%stat /= PLASTIC_OK) then
             ps%converged = .false.
             if (present(stat)) stat = ps%stat
+            return
+        end if
+
+        if (trim(ps%par%mode) == "surface") then
+            call solve_surface(ps, z_bed, z_sl, tau_b, mask, stat)
             return
         end if
 
@@ -254,6 +263,70 @@ contains
         if (present(stat)) stat = ps%stat
     end subroutine plastic_solve
 
+    ! mode "surface": z_s from one fast-sweeping solve of the surface equation.
+    ! Ice-free cells hold z_s = z_bed + H_flt; H = z_s - z_bed on the ice.
+    subroutine solve_surface(ps, z_bed, z_sl, tau_b, mask, stat)
+        type(plastic_t),   intent(inout) :: ps
+        real(dp),          intent(in)    :: z_bed(:,:), z_sl(:,:), tau_b(:,:)
+        logical,           intent(in)    :: mask(:,:)
+        integer, optional, intent(out)   :: stat
+        integer :: nx, ny, i, j, ns, n_unreached
+        logical :: ok
+
+        nx = ps%nx
+        ny = ps%ny
+        ps%n_outer_used = 0
+        ps%outer_change = 0.0_dp
+        ps%warm_used    = .false.
+        ps%n_new_cells  = 0
+
+        call surface_bc(ps, z_bed, z_sl, tau_b)
+        call sweep_eikonal(nx, ny, ps%wk%wc, ps%wk%G, mask, ps%wk%bc, ps%dx, ps%dy, &
+                           ps%par%max_sweeps, ps%par%tol, ns, ok, zb=z_bed)
+        ps%n_sweeps  = ns
+        ps%converged = ok
+        if (.not. ok) ps%msg = "plastic_solve: surface sweep reached max_sweeps"
+
+        n_unreached = 0
+        do j = 1, ny
+            do i = 1, nx
+                if (mask(i, j) .and. ps%wk%wc(i, j) < BIG) then
+                    ps%z_srf(i, j) = ps%wk%wc(i, j)
+                    ps%H(i, j)     = ps%wk%wc(i, j) - z_bed(i, j)
+                    ps%w(i, j)     = ps%H(i, j) * ps%H(i, j)
+                else if (mask(i, j)) then
+                    n_unreached    = n_unreached + 1
+                    ps%z_srf(i, j) = z_bed(i, j)
+                    ps%H(i, j)     = 0.0_dp
+                    ps%w(i, j)     = BIG
+                else
+                    ps%z_srf(i, j) = z_bed(i, j)
+                    ps%H(i, j)     = 0.0_dp
+                    ps%w(i, j)     = (ps%wk%bc(i, j) - z_bed(i, j))**2
+                end if
+            end do
+        end do
+        call finalize_status(ps, mask, n_unreached)
+        if (present(stat)) stat = ps%stat
+    end subroutine solve_surface
+
+    ! Surface-mode boundary values bc = z_bed + H_flt (all cells) and K = tau_b/(rho_i g)
+    ! in ps%wk%bc and ps%wk%G.
+    subroutine surface_bc(ps, z_bed, z_sl, tau_b)
+        type(plastic_t), intent(inout) :: ps
+        real(dp),        intent(in)    :: z_bed(:,:), z_sl(:,:), tau_b(:,:)
+        integer  :: i, j
+        real(dp) :: rg
+
+        rg = ps%par%rho_i * ps%par%g
+        do j = 1, ps%ny
+            do i = 1, ps%nx
+                ps%wk%bc(i, j) = z_bed(i, j) + plastic_flotation_thickness(z_bed(i, j), z_sl(i, j), ps%par)
+                ps%wk%G(i, j)  = tau_b(i, j) / rg
+            end do
+        end do
+    end subroutine surface_bc
+
     ! Count the ice cells without a valid stored w (new to the mask) and all ice cells.
     subroutine warm_start_cells(ps, mask, n_new, n_ice)
         type(plastic_t), intent(in)  :: ps
@@ -294,7 +367,6 @@ contains
         real(dp),        intent(in)    :: z_bed(:,:)
         logical,         intent(in)    :: mask(:,:)
         integer :: i, j, n_unreached
-        character(len=32) :: s
 
         n_unreached = 0
         do j = 1, ps%ny
@@ -309,6 +381,16 @@ contains
                 end if
             end do
         end do
+        call finalize_status(ps, mask, n_unreached)
+    end subroutine finalize_geometry
+
+    ! Status from ps%converged and the unreached ice cells; store the mask for the
+    ! next warm start.
+    subroutine finalize_status(ps, mask, n_unreached)
+        type(plastic_t), intent(inout) :: ps
+        logical,         intent(in)    :: mask(:,:)
+        integer,         intent(in)    :: n_unreached
+        character(len=32) :: s
 
         if (n_unreached > 0) then
             ps%converged = .false.
@@ -324,7 +406,7 @@ contains
 
         ps%wk%mask_prev = mask
         ps%has_warm = .true.
-    end subroutine finalize_geometry
+    end subroutine finalize_status
 
     ! Shape of an (nx,ny) input; sets ps%stat/msg on mismatch.
     subroutine check_shape(ps, nx, ny, name)
@@ -348,9 +430,10 @@ contains
             ps%msg  = "plastic: not initialized (call plastic_init)"
             return
         end if
-        if (trim(ps%par%mode) /= "full" .and. trim(ps%par%mode) /= "flat") then
+        if (trim(ps%par%mode) /= "full" .and. trim(ps%par%mode) /= "flat" .and. &
+            trim(ps%par%mode) /= "surface") then
             ps%stat = PLASTIC_BAD_INPUT
-            ps%msg  = "plastic: par%mode must be ""full"" or ""flat"""
+            ps%msg  = "plastic: par%mode must be ""full"", ""flat"" or ""surface"""
             return
         end if
         call check_shape(ps, size(z_bed, 1), size(z_bed, 2), "z_bed")
@@ -399,8 +482,9 @@ contains
         if (n > 0) mis = mis / real(n, dp)
     end function plastic_surface_misfit
 
-    ! Godunov residual of the stored w for the current par%mode (convergence check):
-    ! r = w - (Godunov update) on ice cells, w - H_flt^2 elsewhere; ~0 when converged.
+    ! Godunov residual of the stored solution for the current par%mode (convergence
+    ! check): r = w - (Godunov update) on ice cells, w - H_flt^2 elsewhere (in mode
+    ! "surface" the same for z_s, with z_bed + H_flt); ~0 when converged.
     subroutine plastic_residual(ps, z_bed, z_sl, tau_b, mask, r, stat)
         type(plastic_t),   intent(inout) :: ps
         real(dp),          intent(in)    :: z_bed(:,:), z_sl(:,:), tau_b(:,:)
@@ -423,6 +507,13 @@ contains
 
         nx = ps%nx
         ny = ps%ny
+        if (trim(ps%par%mode) == "surface") then
+            call surface_bc(ps, z_bed, z_sl, tau_b)
+            call surface_field(ps, mask, ps%wk%wc)
+            call godunov_residual_surface(nx, ny, ps%wk%wc, ps%wk%G, z_bed, mask, ps%wk%bc, &
+                                          ps%dx, ps%dy, r)
+            return
+        end if
         call flotation_bc(nx, ny, z_bed, z_sl, ps%par, ps%wk%bc)
         call rhs_flat(nx, ny, tau_b, ps%par, ps%wk%G)
         if (trim(ps%par%mode) == "full") then
@@ -434,5 +525,75 @@ contains
             call godunov_residual(nx, ny, ps%w, ps%wk%G, mask, ps%wk%bc, ps%dx, ps%dy, r)
         end if
     end subroutine plastic_residual
+
+    ! Surface field of the stored solution with the margin values: ps%z_srf on the
+    ! ice, ps%wk%bc (= z_bed + H_flt, from surface_bc) elsewhere.
+    subroutine surface_field(ps, mask, u)
+        type(plastic_t), intent(in)  :: ps
+        logical,         intent(in)  :: mask(:,:)
+        real(dp),        intent(out) :: u(:,:)
+        integer :: i, j
+        do j = 1, ps%ny
+            do i = 1, ps%nx
+                if (mask(i, j)) then
+                    u(i, j) = ps%z_srf(i, j)
+                else
+                    u(i, j) = ps%wk%bc(i, j)
+                end if
+            end do
+        end do
+    end subroutine surface_field
+
+    ! Stress residual of the stored geometry (any mode): on ice cells with tau_b > 0
+    ! and H > 0, r = | |grad z_s| rho_i g H - tau_b | / tau_b, with the Godunov upwind
+    ! gradient |grad z_s|^2 = ((z_s - a)+/dx)^2 + ((z_s - b)+/dy)^2 (a, b the lower
+    ! neighbour surfaces; z_bed + H_flt on ice-free neighbours). rmax = max r; r = 0
+    ! elsewhere. A cell-centred measure: on the exact Nye profile it is O(1) at the first
+    ! ice cell (the one-sided slope of a sqrt profile), so read it away from the margin.
+    subroutine plastic_stress_residual(ps, z_bed, z_sl, tau_b, mask, rmax, r, stat)
+        type(plastic_t),    intent(inout) :: ps
+        real(dp),           intent(in)    :: z_bed(:,:), z_sl(:,:), tau_b(:,:)
+        logical,            intent(in)    :: mask(:,:)
+        real(dp),           intent(out)   :: rmax
+        real(dp), optional, intent(out)   :: r(:,:)
+        integer,  optional, intent(out)   :: stat
+        integer  :: i, j, im, ip, jm, jp, stat_solve
+        real(dp) :: a, b, u, gx, gy, rr, rg
+        character(len=MSG_LEN) :: msg_solve
+
+        stat_solve = ps%stat
+        msg_solve  = ps%msg
+        ps%stat = PLASTIC_OK
+        call check_inputs(ps, z_bed, z_sl, tau_b, mask)
+        if (present(r)) call check_shape(ps, size(r, 1), size(r, 2), "r")
+        if (present(stat)) stat = ps%stat
+        rmax = 0.0_dp
+        if (ps%stat /= PLASTIC_OK) return
+        ps%stat = stat_solve
+        ps%msg  = msg_solve
+
+        call surface_bc(ps, z_bed, z_sl, tau_b)
+        call surface_field(ps, mask, ps%wk%wc)
+        rg = ps%par%rho_i * ps%par%g
+        do j = 1, ps%ny
+            jm = max(j - 1, 1)
+            jp = min(j + 1, ps%ny)
+            do i = 1, ps%nx
+                rr = 0.0_dp
+                if (mask(i, j) .and. tau_b(i, j) > 0.0_dp .and. ps%H(i, j) > 0.0_dp) then
+                    im = max(i - 1, 1)
+                    ip = min(i + 1, ps%nx)
+                    u  = ps%wk%wc(i, j)
+                    a  = min(ps%wk%wc(im, j), ps%wk%wc(ip, j))
+                    b  = min(ps%wk%wc(i, jm), ps%wk%wc(i, jp))
+                    gx = max(u - a, 0.0_dp) / ps%dx
+                    gy = max(u - b, 0.0_dp) / ps%dy
+                    rr = abs(sqrt(gx * gx + gy * gy) * rg * ps%H(i, j) - tau_b(i, j)) / tau_b(i, j)
+                end if
+                rmax = max(rmax, rr)
+                if (present(r)) r(i, j) = rr
+            end do
+        end do
+    end subroutine plastic_stress_residual
 
 end module plastic_solver
