@@ -163,6 +163,7 @@ contains
         tsw = 0.0_dp; tsc = 0.0_dp; nsw = 0; nsc = 0
         H_smb = -1.0_dp
         if (do_smb == 1) then
+            ctrl%mode = "flat"          ! as PlasticIceSheet.jl
             call plastic_init(ps, nx, ny, dx, dy)
             t0 = wall_time()
             call plastic_solve_smb(ps, z_bed, z_sl, smb, mask, rheo, slide, ctrl=ctrl)

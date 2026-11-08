@@ -214,7 +214,15 @@ contains
         write(*, '(a,es10.3,a,i0)') "        fixed point max|H - H0| ", maxval(abs(pr%H - H0), mask=mask), &
             " m, n_outer ", pr%n_outer_used
         call check(st == PLASTIC_OK, "fixed point: converged")
-        call check(maxval(abs(pr%H - H0), mask=mask) < 1.0e-6_dp, "plastic solution is a fixed point")
+        call check(maxval(abs(pr%H - H0), mask=mask) < 1.0e-6_dp, "plastic solution is a fixed point (inner surface)")
+        ctrl%mode = "flat"
+        call plastic_solve_smb(pr, z_b, z_sl, smb, mask, r, sl, ctrl=ctrl, H_init=H0, stat=st)
+        call check(st == PLASTIC_OK .and. maxval(abs(pr%H - H0), mask=mask) < 1.0e-6_dp, &
+                   "plastic solution is a fixed point (inner flat, Julia parity)")
+        ctrl%mode = "steep"
+        call plastic_solve_smb(pr, z_b, z_sl, smb, mask, r, sl, ctrl=ctrl, H_init=H0, stat=st)
+        call check(st == PLASTIC_BAD_INPUT, "unknown ctrl%mode -> PLASTIC_BAD_INPUT")
+        ctrl = plastic_smb_ctrl_t()
 
         ! Recovered from a flat 400 m start by the under-relaxed iteration.
         Hg = 0.0_dp

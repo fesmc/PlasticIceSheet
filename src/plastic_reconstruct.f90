@@ -4,14 +4,14 @@
 !
 !   1. routes smb down the current surface        -> required throughput Q
 !   2. inverts the DIVA flux law per cell for tau_d with Q/w = H (u_b(tau_d) + u_def(tau_d,H))
-!   3. sweeps the plastic eikonal (flat RHS) with tau_d -> new thickness
+!   3. solves the plastic equation with tau_d (ctrl%mode)  -> new thickness
 !   4. under-relaxes H and repeats.
 !
 ! The plastic solution is a fixed point when smb is its own implied SMB.
 module plastic_reconstruct
 
     use plastic_kinds,   only: dp, BIG
-    use plastic_eikonal, only: flotation_bc, sweep_eikonal
+    use plastic_eikonal, only: flotation_bc, sweep_eikonal, plastic_flotation_thickness
     use plastic_solver,  only: plastic_t, check_shape, warm_start_cells, &
                                PLASTIC_OK, PLASTIC_NOT_CONVERGED, PLASTIC_BAD_INPUT
     use plastic_flow,    only: plastic_glen_t, plastic_sliding_t, LAW_COULOMB, &
@@ -23,15 +23,16 @@ module plastic_reconstruct
     private
     public :: plastic_smb_ctrl_t, plastic_solve_smb, plastic_invert_driving_stress
 
-    ! Controls of plastic_solve_smb (defaults as diva_reconstruct).
+    ! Controls of plastic_solve_smb (defaults as diva_reconstruct, except mode).
     type plastic_smb_ctrl_t
+        character(len=8) :: mode = "surface"  ! inner plastic solve: "surface" | "flat" (Julia parity)
         integer  :: n_outer    = 1000       ! outer iterations cap
         real(dp) :: relax      = 0.05_dp    ! under-relaxation in (0,1]
         real(dp) :: tol        = 1.0_dp     ! exit on max|dH| [m] (before relaxation)
         real(dp) :: tau_hi     = 5.0e5_dp   ! upper bracket of the tau_d inversion [Pa]
         integer  :: max_sweeps = 400        ! inner eikonal controls
         real(dp) :: sweep_tol  = 1.0e-9_dp
-        real(dp) :: tau_init   = 5.0e4_dp   ! uniform tau_b of the cold-start flat solve [Pa]
+        real(dp) :: tau_init   = 5.0e4_dp   ! uniform tau_b of the cold-start plastic solve [Pa]
     end type plastic_smb_ctrl_t
 
 contains
@@ -88,7 +89,8 @@ contains
 
     ! SMB-driven reconstruction of H, z_srf (and w = H^2) on ps, from bed z_bed, sea
     ! level z_sl, smb [m ice / yr] and the grounded-ice mask, for the DIVA flux law
-    ! (rheo, slide). The inner sweep uses the flat RHS (bed relief to first order).
+    ! (rheo, slide). The inner plastic solve is ctrl%mode: "surface" (default; the bed
+    ! relief in full, see plastic_solve) or "flat" (as PlasticIceSheet.jl).
     !
     ! Start: H_init if given; else, with warm=.true. and a stored solution, the stored
     ! H on cells that were ice before and a cold-start value on the new cells (cold
@@ -111,8 +113,8 @@ contains
         integer,                  optional, intent(out)   :: stat
 
         type(plastic_smb_ctrl_t) :: c
-        integer  :: nx, ny, i, j, it, code, ns, n_new, n_ice, n_unreached
-        logical  :: ok, inner_ok, outer_ok, start_warm
+        integer  :: nx, ny, i, j, it, code, n_new, n_ice, n_unreached
+        logical  :: inner_ok, outer_ok, start_warm, surf
         real(dp) :: rg, wf, delta, Hn, r
         character(len=32) :: s
 
@@ -128,6 +130,9 @@ contains
         else if (code == 0) then
             ps%stat = PLASTIC_BAD_INPUT
             ps%msg  = "plastic_solve_smb: slide%law must be linear, weertman or coulomb"
+        else if (trim(c%mode) /= "surface" .and. trim(c%mode) /= "flat") then
+            ps%stat = PLASTIC_BAD_INPUT
+            ps%msg  = "plastic_solve_smb: ctrl%mode must be ""surface"" or ""flat"""
         else if (.not. (c%relax > 0.0_dp .and. c%relax <= 1.0_dp)) then
             ps%stat = PLASTIC_BAD_INPUT
             ps%msg  = "plastic_solve_smb: ctrl%relax must be in (0,1]"
@@ -156,7 +161,16 @@ contains
         ps%n_new_cells  = 0
         inner_ok = .true.
 
-        call flotation_bc(nx, ny, z_bed, z_sl, ps%par, ps%wk%bc)
+        surf = (trim(c%mode) == "surface")
+        if (surf) then
+            do j = 1, ny
+                do i = 1, nx
+                    ps%wk%bc(i, j) = z_bed(i, j) + plastic_flotation_thickness(z_bed(i, j), z_sl(i, j), ps%par)
+                end do
+            end do
+        else
+            call flotation_bc(nx, ny, z_bed, z_sl, ps%par, ps%wk%bc)
+        end if
 
         ! --- initial thickness ----------------------------------------------------------
         start_warm = .false.
@@ -177,7 +191,7 @@ contains
                         if (.not. mask(i, j)) then
                             ps%H(i, j) = 0.0_dp
                         else if (.not. (ps%wk%mask_prev(i, j) .and. ps%w(i, j) < BIG)) then
-                            ps%H(i, j) = sqrt(max(ps%wk%wc(i, j), 0.0_dp))
+                            ps%H(i, j) = thick(i, j)
                         end if
                     end do
                 end do
@@ -186,7 +200,7 @@ contains
                 do j = 1, ny
                     do i = 1, nx
                         if (mask(i, j)) then
-                            ps%H(i, j) = sqrt(max(ps%wk%wc(i, j), 0.0_dp))
+                            ps%H(i, j) = thick(i, j)
                         else
                             ps%H(i, j) = 0.0_dp
                         end if
@@ -218,19 +232,15 @@ contains
                     else
                         ps%wk%f2(i, j) = 0.0_dp
                     end if
-                    ps%wk%G(i, j) = 2.0_dp * ps%wk%f2(i, j) / rg
                 end do
             end do
-            call sweep_eikonal(nx, ny, ps%wk%wc, ps%wk%G, mask, ps%wk%bc, ps%dx, ps%dy, &
-                               c%max_sweeps, c%sweep_tol, ns, ok)
-            ps%n_sweeps = ps%n_sweeps + ns
-            inner_ok = inner_ok .and. ok
+            call plastic_sweep(ps%wk%f2, ps%wk%wc)
 
             delta = 0.0_dp
             do j = 1, ny
                 do i = 1, nx
                     if (mask(i, j)) then
-                        Hn = sqrt(max(ps%wk%wc(i, j), 0.0_dp))
+                        Hn = thick(i, j)
                     else
                         Hn = 0.0_dp
                     end if
@@ -266,7 +276,11 @@ contains
                     ps%w(i, j)     = ps%H(i, j) * ps%H(i, j)
                 else
                     ps%z_srf(i, j) = z_bed(i, j)
-                    ps%w(i, j)     = ps%wk%bc(i, j)
+                    if (surf) then
+                        ps%w(i, j) = (ps%wk%bc(i, j) - z_bed(i, j))**2
+                    else
+                        ps%w(i, j) = ps%wk%bc(i, j)
+                    end if
                 end if
             end do
         end do
@@ -288,17 +302,42 @@ contains
 
     contains
 
-        ! Flat plastic solve at the uniform tau_b = c%tau_init, into u (= w).
+        ! Plastic solve at the uniform tau_b = c%tau_init, into u.
         subroutine cold_start(u)
+            real(dp), intent(out) :: u(:,:)
+            ps%wk%f2 = c%tau_init
+            call plastic_sweep(ps%wk%f2, u)
+        end subroutine cold_start
+
+        ! Inner plastic solve for the driving stress tau into u (w = H^2 for "flat",
+        ! z_s for "surface"), with the margin values in ps%wk%bc.
+        subroutine plastic_sweep(tau, u)
+            real(dp), intent(in)  :: tau(:,:)
             real(dp), intent(out) :: u(:,:)
             integer :: ns0
             logical :: ok0
-            ps%wk%G = 2.0_dp * c%tau_init / rg
-            call sweep_eikonal(nx, ny, u, ps%wk%G, mask, ps%wk%bc, ps%dx, ps%dy, &
-                               c%max_sweeps, c%sweep_tol, ns0, ok0)
+            if (surf) then
+                ps%wk%G = tau / rg
+                call sweep_eikonal(nx, ny, u, ps%wk%G, mask, ps%wk%bc, ps%dx, ps%dy, &
+                                   c%max_sweeps, c%sweep_tol, ns0, ok0, zb=z_bed)
+            else
+                ps%wk%G = 2.0_dp * tau / rg
+                call sweep_eikonal(nx, ny, u, ps%wk%G, mask, ps%wk%bc, ps%dx, ps%dy, &
+                                   c%max_sweeps, c%sweep_tol, ns0, ok0)
+            end if
             ps%n_sweeps = ps%n_sweeps + ns0
             inner_ok = inner_ok .and. ok0
-        end subroutine cold_start
+        end subroutine plastic_sweep
+
+        ! Thickness of an ice cell from the inner solution in ps%wk%wc.
+        real(dp) function thick(i, j)
+            integer, intent(in) :: i, j
+            if (surf) then
+                thick = max(ps%wk%wc(i, j) - z_bed(i, j), 0.0_dp)
+            else
+                thick = sqrt(max(ps%wk%wc(i, j), 0.0_dp))
+            end if
+        end function thick
 
     end subroutine plastic_solve_smb
 
