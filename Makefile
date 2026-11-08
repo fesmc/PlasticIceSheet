@@ -87,7 +87,7 @@ $(objdir)/libplastic.a: $(plastic_objs)
 	@echo " "
 
 # Test programs: no dependencies beyond the library.
-check_progs = test_core test_closures
+check_progs = test_core test_closures test_surface
 
 $(objdir)/plastic_test_utils.o: $(testdir)/test_utils.f90 $(objdir)/libplastic.a
 	$(FC) $(DFLAGS) $(FFLAGS) -c -o $@ $<
