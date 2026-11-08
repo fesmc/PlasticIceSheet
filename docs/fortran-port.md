@@ -3,7 +3,9 @@
 A dependency-free Fortran library (`libplastic.a`) with the forward solver and the
 closures of [PlasticIceSheet.jl](https://github.com/fesmc/PlasticIceSheet.jl), for
 coupling into kryos as an ice backend. Not ported: the AD / implicit-differentiation
-extension and the tau_b inversion.
+extension and the tau_b inversion. Added: mode `"surface"` (not in the Julia package),
+which solves the plastic surface equation for z_s directly; it is the recommended mode
+for kryos (see [Mode "surface"](#mode-surface)).
 
 ## API
 
@@ -11,7 +13,7 @@ extension and the tau_b inversion.
 `(nx,ny)`, `i = x`, `j = y`, as in Julia.
 
 ```fortran
-type(plastic_par_t)  :: par   ! rho_i=917, rho_w=1025, g=9.80665, H_min=1, mode="full"|"flat",
+type(plastic_par_t)  :: par   ! rho_i=917, rho_w=1025, g=9.80665, H_min=1, mode="full"|"flat"|"surface",
                               ! max_sweeps=200, n_outer=100, tol=1e-6, outer_tol=1e-3, relax=0.5,
                               ! warm_frac_max=0.1
 type(plastic_t)      :: ps    ! par, nx, ny, dx, dy, w=H^2, H, z_srf, n_outer_used, converged,
@@ -19,7 +21,9 @@ type(plastic_t)      :: ps    ! par, nx, ny, dx, dy, w=H^2, H, z_srf, n_outer_us
 
 call plastic_init(ps, nx, ny, dx, dy [, par, stat])
 call plastic_solve(ps, z_bed, z_sl, tau_b, mask [, warm, stat])
-call plastic_residual(ps, z_bed, z_sl, tau_b, mask, r [, stat])  ! Godunov residual of ps%w
+call plastic_residual(ps, z_bed, z_sl, tau_b, mask, r [, stat])  ! Godunov residual (w, or z_s in "surface")
+call plastic_stress_residual(ps, z_bed, z_sl, tau_b, mask, rmax [, r, stat])
+                              ! | |grad z_s| rho_i g H - tau_b | / tau_b, upwind gradient, any mode
 call plastic_reset(ps)                                            ! drop the warm start
 call plastic_end(ps)
 H_flt = plastic_flotation_thickness(z_bed, z_sl, par)             ! elemental
@@ -82,6 +86,57 @@ rate rho ~ 0.7 of the damped map each is within ~rho/(1-rho) outer_tol of the fi
 point, so they agree to a few `outer_tol` (and converge to the same fixed point as
 `outer_tol -> 0`, see the tests).
 
+## Mode "surface"
+
+Not in PlasticIceSheet.jl. The ICESHEET formulation: the plastic surface equation
+
+    |grad z_s| = tau_b / (rho_i g (z_s - z_b))
+
+is solved for u = z_s itself by one fast-sweeping solve, with no outer iteration and
+no warm start (`warm` has no effect). Ice-free cells hold z_s = z_b + H_flt(z_b, z_sl);
+H = z_s - z_b on the ice. `par%tol` applies to z_s [m].
+
+Why: the right-hand side depends on z_s only through the cell's own thickness, so the
+Hamiltonian |p| - tau_b/(rho_i g (u - z_b)) is increasing in u (proper) and the Godunov
+update is monotone: the comparison principle and fast sweeping apply directly. The
+`"full"` mode solves the same continuous equation for w = H^2, |grad w + 2 sqrt(w) grad z_b|
+= 2 tau_b/(rho_i g), whose Hamiltonian is increasing in w only where grad z_s . grad z_b > 0
+(not on reverse bed slopes), and handles the bed term by a lagged, central-difference
+fixed point; that map has no attracting fixed point on GRL-32KM or NH-32KM.
+
+Discretisation (`godunov_surface` in `src/plastic_eikonal.f90`): per axis, the upwind
+difference times the edge-mean thickness,
+
+    P_a(H) = (H - alpha)+ (H + alpha+) / 2,   alpha = a - z_b,ij   (a: lower x-neighbour surface)
+    (P_a/dx)^2 + (P_b/dy)^2 = (tau_b/(rho_i g))^2.
+
+P_a increases with H and does not increase with a (dP_a/da = z_b - a <= 0 for a >= z_b, and
+-H/2 below), so the scheme is proper and monotone; the update is the unique root, in closed
+form (the w-eikonal with w_a = alpha^2) when both neighbour surfaces are above the bed,
+else by Newton from the smaller one-sided root (monotone, P^2 convex). On a flat bed it
+is identical to `"flat"` (exact 1-D Nye profile).
+
+The literal cell-centred form, (u - a)+^2/dx^2 + ... = (tau_b/(rho_i g (u - z_b)))^2, is also
+monotone but inaccurate at the margin: on a flat bed its first ice cell is
+H = sqrt(tau_b dx/(rho_i g)) instead of the Nye value sqrt(2 tau_b dx/(rho_i g)), 29 % low at
+every dx, with order ~0.75 convergence at a fixed distance (test_surface). Hence the
+edge mean.
+
+Tests (`tests/test_surface.f90`):
+
+| test | result |
+|---|---|
+| kernel, 2e5 random cases (neighbours above/below the bed, dx /= dy) | solves its equation to 5e-11, H > 0, nondecreasing in a and b |
+| 1-D Nye strip, dx = 4 km ... 250 m | surface and flat exact (< 1e-13); cell-centred variant 29 % low at the first cell, 2.3 % at 8 km for dx = 250 m |
+| circular cap, flat bed, dx = 2 km ... 250 m | surface == flat (< 7e-11 m); mean error r < R/2: 6.7, 2.4, 1.4, 0.66 m (order ~1) |
+| 1-D sloped bed (5e-3) vs ODE, dx = 4 km ... 500 m | max error surface 9.3, 4.7, 2.4, 1.2 m (order 0.98); full 6.1, 3.3, 1.8, 0.9 m; flat 313 m |
+| bed bump (300 m) where full converges, dx = 2, 1, 0.5 km | max abs(surface - full) (r < 24 km) 11.3, 6.2, 3.4 m; max abs(flat - full) 117 m |
+
+The residual of `plastic_stress_residual` is cell-centred (H of the cell): it is exactly
+1 where the edge mean is (H + 0)/2, i.e. at the first ice cell and where a neighbour
+surface lies below the cell's bed, and O(dx) elsewhere. Its scheme-consistent
+counterpart is `plastic_residual` (the Godunov residual of z_s), < 1e-8 m.
+
 ## Build
 
 ```bash
@@ -105,7 +160,8 @@ and `DFLAGS_*`; ifx uses `-O3 -march=core-avx2 -fp-model precise`.
 
 ## Tests
 
-`make check` runs `tests/test_core.f90` and `tests/test_closures.f90`: the Julia test
+`make check` runs `tests/test_core.f90`, `tests/test_closures.f90` and
+`tests/test_surface.f90` (see [Mode "surface"](#mode-surface)): the Julia test
 set (godunov kernel, Nye profile, flat vs full, full over bed relief and its residual,
 constitutive laws, DIVA velocity, closure B round trip `balance_flux(smb_implied) = u H`
 to 1e-16, balance flux and A <-> B consistency, implied basal velocity, the SMB-driven
@@ -174,3 +230,46 @@ The gain is limited by the linear rate (rho ~ 0.7) of the damped fixed point: fr
 initial error e0 it needs ~log(e0/outer_tol)/log(1/rho) iterations, so even a small
 change costs tens of iterations. Where the fixed point does not converge (grl32) the warm
 start gains nothing.
+
+## Mode "surface" on real data
+
+Same driver and job (`compare/plastic_compare.f90`), sea level 0, uniform tau_b = 1e5 Pa:
+GRL-32KM as above; NH-32KM (276 x 276) with the FesmData GEBCO2026 bed and the mask
+PaleoMIST H_ice > 0 at 20 ka (`nh32_20ka`, 27669 ice cells) and 0 ka (`nh32_0ka`, 3055).
+
+| case | surface: sweeps, t [s] | flat t [s] | full t [s] (converged) | Godunov residual [m] |
+|---|---|---|---|---|
+| synth150 | 0.0027 | 0.0010 | 0.084 (yes, 44) | |
+| synth300 | 0.0105 | 0.0055 | 0.48 (yes, 62) | |
+| grl32 | 9, 0.0007 | 0.0002 | 0.23 (no, 500) | 0 |
+| nh32_20ka | 12, 0.0116 | 0.0044 | 9.5 (no, 500) | 7.5e-9 |
+| nh32_0ka | 9, 0.0028 | 0.0012 | 1.2 (no, 500) | 0 |
+
+Surface converges in one sweep solve everywhere, at 2-3 times the cost of flat and
+40-800 times less than full. Where full converges (synthetic caps) surface agrees with
+it to rms 2.7 m (dx = 2 km, 150 x 150) and 1.4 m (300 x 300, same dx).
+
+Bed relief, surface - flat over the ice:
+
+| case | mean [m] | rms [m] | max [m] | where (max) | mean abs by bed slope < 0.005 / 0.005-0.02 / > 0.02 [m] | cells > 100 m |
+|---|---|---|---|---|---|---|
+| synth150 | | 71.6 | -178 | | | |
+| grl32 | +95 | 291 | +1106 | x = 240, y = -1690 km (north-east interior; bed -75 m, H_flat 2668 m) | 220 / 223 / 304 | 1183 / 1710 |
+| nh32_0ka | -73 | 278 | +1054 | x = 252, y = -1688 km (same place; bed -29 m) | 195 / 222 / 368 | 2059 / 3055 |
+| nh32_20ka | -157 | 413 | +2662 | x = -3620, y = 1960 km (bed -4414 m, slope 0.054) | 224 / 454 / 687 | 18174 / 27669 |
+
+Bed relief changes H by a few hundred metres over most of the ice at 32 km, and more on
+steep beds. Flat drapes the thickness over the bed (z_s follows z_b); surface keeps the
+surface continuous, so it thickens the ice over inland bed depressions (the interior
+behind the coastal mountains) and thins it over highs. The 20 ka maximum is a
+deep-ocean cell inside the PaleoMIST mask (H_ice > 0 includes ice over 4 km of water),
+where flat puts the surface 2 km below sea level.
+
+Stress residual | |grad z_s| rho_i g H - tau_b | / tau_b (cell-centred, upwind), median
+over the ice: surface 0.04 (grl32), 0.02 (nh32_20ka), 0.14 (nh32_0ka), max 1.0 (see
+above); flat 0.49 / 0.39 / 0.76, max up to 22; full (not converged) 0.30 / 0.21 / 0.34,
+max up to 16.
+
+Recommendation for kryos: `mode = "surface"` (one sweep solve, no fixed point, bed
+relief included, converges on GRL-32KM and NH-32KM). `"flat"` remains the cheapest and
+equals `"surface"` on flat beds; `"full"` only reproduces PlasticIceSheet.jl.
