@@ -65,7 +65,7 @@ $(objdir)/plastic_ice.o: $(srcdir)/plastic_ice.f90 $(objdir)/plastic_reconstruct
 ## Targets
 ###############################################
 
-.PHONY: usage all static clean
+.PHONY: usage all static test check clean
 
 usage:
 	@echo "make static [config=<machine>_<compiler>]   -> $(objdir)/libplastic.a + .mod files"
@@ -84,6 +84,24 @@ $(objdir)/libplastic.a: $(plastic_objs)
 	@echo "    $(objdir)/libplastic.a is ready (FC=$(FC))."
 	@echo "    link with: -I$(CURDIR)/$(objdir) -L$(CURDIR)/$(objdir) -lplastic"
 	@echo " "
+
+# Test programs: no dependencies beyond the library.
+check_progs = test_core test_closures
+
+$(objdir)/plastic_test_utils.o: $(testdir)/test_utils.f90 $(objdir)/libplastic.a
+	$(FC) $(DFLAGS) $(FFLAGS) -c -o $@ $<
+
+$(bindir)/%.x: $(testdir)/%.f90 $(objdir)/plastic_test_utils.o $(objdir)/libplastic.a
+	$(FC) $(DFLAGS) $(FFLAGS) -o $@ $< $(objdir)/plastic_test_utils.o -L$(objdir) -lplastic $(LFLAGS)
+
+test: $(addprefix $(bindir)/, $(addsuffix .x, $(check_progs)))
+
+# Build and run the tests; fails on the first failing program.
+check: test
+	@for t in $(check_progs); do \
+		$(bindir)/$$t.x || { echo "FAILED: $$t"; exit 1; }; \
+	done
+	@echo "make check: all tests passed (FC=$(FC))"
 
 clean:
 	rm -f $(objdir)/*.o $(objdir)/*.mod $(objdir)/*.a $(objdir)/*.smod $(bindir)/*.x
