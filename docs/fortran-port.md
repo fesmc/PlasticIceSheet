@@ -270,6 +270,94 @@ matching implied-SMB operator, replacing the MFD closures, so the plastic soluti
 a fixed point), and how the result relates to the plastic modes (tau_d = rho_i g H
 abs(grad z_s) becomes an output).
 
+## SMB-driven reconstruction: direct steady formulation (design)
+
+`ctrl%method = "steady"` (default) solves steady mass conservation directly; `"routing"`
+keeps the Julia iteration (conditionally stable, see above).
+
+### Equations
+
+Unknown: H >= 0 on the ice cells (mask); surface s = z_b + H. Membrane-free DIVA flux
+(the closures' flux law with the driving stress taken from the geometry):
+
+    q = -H U(tau, H) grad s / |grad s|,  tau = rho_i g H |grad s|,  U = u_b(tau) + 2A/(n+2) tau^n H
+
+(Coulomb: tau capped at 0.999 C). Steady state with the obstacle H >= 0 is the
+complementarity problem
+
+    H >= 0,  F(H) = div q - smb >= 0,  H F(H) = 0
+
+(F > 0 at H = 0: ablation exceeds the inflow, the cell stays ice-free).
+
+### Discretisation (finite volumes, staggered fluxes)
+
+Interior face between ice cells P and E (x shown, y alike): H_f = (H_P + H_E)/2,
+s_x = (s_E - s_P)/dx, s_y = mean of the central y-differences of s at P and E,
+|grad s| = sqrt(s_x^2 + s_y^2), tau_f = rho_i g H_f |grad s|,
+q_x = -H_f U(tau_f, H_f) s_x/|grad s| (0 where grad s = 0). Ice-free cells carry
+s = z_b + H_flt (the plastic margin value). Faces on the array edge carry no flux.
+
+Margin face (ice cell P, ice-free neighbour M). The margin lies d_c = (1 - margin_frac_M) dx
+from the centre of P (the margin position of the plastic solve). Derivation: on the
+segment from P to the margin the flux is the membrane-free flux with the one-sided
+slope over that segment and the segment-mean thickness,
+
+    g = (s_P - s_M)/d_c,  H_m = (H_P + H_flt,M)/2,  |grad s| = sqrt(g^2 + s_y,P^2),
+    tau_m = rho_i g H_m |grad s|,  q_out = max(H_m U(tau_m, H_m) g/|grad s|, 0)
+
+(s_y,P the central y-difference at P), leaving P through the face towards M; nothing
+enters from an ice-free cell. Why not the plastic profile H ~ sqrt(2 k d) at bounded tau:
+its flux tends to zero at a land margin, so with the margin at or inside the face no ice
+could leave and a positive SMB up to the margin (the Vialov case) would have no steady
+state. The one-sided SIA flux grows without bound with H_P, so every SMB has a steady
+state; it is the Mahaffy face flux with the margin as the neighbour, and with
+margin_frac it uses the same sub-cell margin position as the eikonal.
+
+Cell balance: F_P = (q_e - q_w)/dx + (q_n - q_s)/dy - smb_P.
+
+Implied SMB (closure B for this method): smb = (q_e - q_w)/dx + (q_n - q_s)/dy of the
+same face fluxes on a given geometry (`plastic_smb_flux_divergence`). The plastic
+solution forced by its own implied SMB is then a root of F, and the steady solve returns
+it (fixed point; exact up to the solver tolerance).
+
+### Solver
+
+Pseudo-transient continuation with a semismooth Newton step per pseudo-time step:
+
+    G(H) = (H - H_k)/dt_k + F(H),  Phi(H) = min(H, c G(H)) = 0,  c = 1 yr.
+
+- Active set A = {cells with H <= c G}: equation H = 0. Inactive cells: the Newton row
+  of G, (1/dt) d_P + sum_K dF_P/dH_K d_K = -G_P, with d_K = -H_K for K in A moved to the
+  right-hand side. New iterate H + d, then max(., 0) (projection).
+- Jacobian dF/dH by finite differences with 9 colours: F_P depends on H in the 3 x 3
+  block around P, so perturbing every third cell in x and y at once gives one column
+  per cell per residual evaluation (10 residual evaluations per Newton step; works for all
+  three sliding laws).
+- dt: switched evolution relaxation, dt_{k+1} = dt_k ||F_k||/||F_{k+1}||, within
+  [ctrl%dt0, ctrl%dt_max]; a step that increases the residual ten-fold is rejected and dt
+  halved. The pseudo-time term keeps the system well posed at divides (where dF/dH
+  vanishes with |grad s|) and at the start.
+- Converged when max over the cells of |min(H, F)| (F alone on ice, max(-F, 0) on
+  ice-free cells) < ctrl%res_tol [m/yr].
+- Start: the stored H (warm) or a surface-mode plastic solve at ctrl%tau_init (cold).
+
+Linear solve (9-point, non-symmetric): CSR matrix over the inactive ice cells.
+- `lis=1` (ifx; fesm-utils' Lis): BiCGStab with ILU(0) through `lis_solver_set_option`
+  ("-i bicgstab -p ilu -tol ... -maxiter ..."), as yelmo's `solver_linear`.
+- Built-in fallback: BiCGStab with ILU(0), no dependency.
+
+### OpenMP and determinism
+
+Residual, Jacobian colouring, CSR assembly and the mat-vec run in parallel loops over
+rows (each row written by one thread: deterministic). Dot products sum fixed blocks of
+4096 entries in parallel and the block sums sequentially, so they do not depend on the
+thread count; the ILU(0) triangular solves are sequential. The built-in solver is
+therefore bit-reproducible for any thread count. Lis uses OpenMP reductions: with
+`lis=1` results can differ between thread counts at the level of the linear tolerance
+(the converged steady state agrees to ctrl%res_tol). The fast sweeping gets an optional
+wavefront ordering (cells of one anti-diagonal in parallel), which is the same
+Gauss-Seidel order and hence bit-identical to the sequential sweep.
+
 ## Build
 
 ```bash
