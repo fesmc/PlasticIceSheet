@@ -2,10 +2,12 @@
 ! steady formulation"): steady mass conservation div q = smb on the mask with the
 ! membrane-free DIVA flux q = -H U(tau, H) grad s/|grad s|, tau = rho_i g H |grad s|, and
 ! the obstacle H >= 0, solved by pseudo-transient continuation with one semismooth
-! (active-set) Newton step per pseudo-time step; a cell is active (H = 0) when an
-! explicit pseudo-time step would empty it, H <= dt F.
+! (active-set) Newton step per pseudo-time step; a cell is active (H = 0) when its own
+! Newton step would empty it, H <= F/(1/dt + dF/dH).
 !
-! Finite volumes with staggered face fluxes: Mahaffy faces between ice cells, and a
+! Finite volumes with staggered face fluxes: faces between ice cells with the mean
+! thickness limited towards the upstream value (face_H; keeps F non-increasing in the
+! neighbours' H), and a
 ! one-sided face flux from an ice cell to the margin (at the margin position of the
 ! plastic solve, margin_frac). The implied SMB of a geometry, plastic_smb_flux_divergence,
 ! is the divergence of the same face fluxes, so a geometry forced by its own implied SMB
@@ -43,6 +45,26 @@ contains
         u = basal_velocity_code(code, slide, tau) + deformational_velocity(rheo, tau, Hf)
         q = -Hf * u * gn / g
     end function face_q
+
+    ! Face thickness between ice cells A and B: the mean (Mahaffy) where the surface drop
+    ! across the face is small against the upstream thickness, limited towards the upstream
+    ! value where it is not. The downstream weight w = min(1/2, H_up/(4 ds)) keeps the face
+    ! flux non-increasing in the downstream thickness (dq/dH_down <= 0 for q ~ H^(p+1) g^p,
+    ! p >= 1, i.e. Glen and the sliding laws), so F_P is non-increasing in its neighbours'
+    ! H: an M-function, for which the active-set Newton step is consistent with H >= 0.
+    pure function face_H(HA, HB, sA, sB) result(Hf)
+        real(dp), intent(in) :: HA, HB, sA, sB
+        real(dp) :: Hf, Hup, Hdn, ds, w
+        if (sA >= sB) then
+            Hup = HA; Hdn = HB
+        else
+            Hup = HB; Hdn = HA
+        end if
+        ds = abs(sA - sB)
+        w = 0.5_dp
+        if (4.0_dp * ds * 0.5_dp > Hup) w = Hup / (4.0_dp * ds)
+        Hf = (1.0_dp - w) * Hup + w * Hdn
+    end function face_H
 
     ! Outflow from ice cell P to the margin at distance dc (one-sided slope, segment-mean
     ! thickness with the margin thickness hmM), never inflow.
@@ -101,7 +123,7 @@ contains
             qx(nx, j) = 0.0_dp
             do i = 1, nx - 1
                 if (mask(i, j) .and. mask(i + 1, j)) then
-                    qx(i, j) = face_q(0.5_dp * (H(i, j) + H(i + 1, j)), (s(i + 1, j) - s(i, j)) / dx, &
+                    qx(i, j) = face_q(face_H(H(i, j), H(i + 1, j), s(i, j), s(i + 1, j)), (s(i + 1, j) - s(i, j)) / dx, &
                                       0.5_dp * (cslope(nx, ny, s, i, j, dy, 2) + cslope(nx, ny, s, i + 1, j, dy, 2)), &
                                       rg, taucap, code, slide, rheo)
                 else if (mask(i, j)) then
@@ -122,7 +144,7 @@ contains
                 if (j == 0 .or. j == ny) then
                     qy(i, j) = 0.0_dp
                 else if (mask(i, j) .and. mask(i, j + 1)) then
-                    qy(i, j) = face_q(0.5_dp * (H(i, j) + H(i, j + 1)), (s(i, j + 1) - s(i, j)) / dy, &
+                    qy(i, j) = face_q(face_H(H(i, j), H(i, j + 1), s(i, j), s(i, j + 1)), (s(i, j + 1) - s(i, j)) / dy, &
                                       0.5_dp * (cslope(nx, ny, s, i, j, dx, 1) + cslope(nx, ny, s, i, j + 1, dx, 1)), &
                                       rg, taucap, code, slide, rheo)
                 else if (mask(i, j)) then
@@ -172,6 +194,30 @@ contains
         end do
         !$omp end parallel do
     end function ncp_norm
+
+    ! Root-mean-square complementarity residual (steering of dt and step acceptance).
+    function ncp_rms(nx, ny, H, F, mask) result(r)
+        integer,  intent(in) :: nx, ny
+        real(dp), intent(in) :: H(nx, ny), F(nx, ny)
+        logical,  intent(in) :: mask(nx, ny)
+        real(dp) :: r, e
+        integer  :: i, j, m
+        r = 0.0_dp
+        m = 0
+        do j = 1, ny
+            do i = 1, nx
+                if (.not. mask(i, j)) cycle
+                if (H(i, j) > 0.0_dp) then
+                    e = F(i, j)
+                else
+                    e = min(F(i, j), 0.0_dp)
+                end if
+                r = r + e * e
+                m = m + 1
+            end do
+        end do
+        if (m > 0) r = sqrt(r / m)
+    end function ncp_rms
 
     ! Margin surface sm = z_b + H_flt and margin thickness hm = H_flt on all cells.
     subroutine steady_margin_values(ps, z_bed, z_sl, sm, hm)
@@ -264,7 +310,9 @@ contains
         logical,                 intent(in)    :: verbose
 
         integer  :: nx, ny, code, k, i, j, a, b, c, ci, cj, n, nz, slot, ii, jj, row, kk, loc(2)
-        real(dp) :: rg, taucap, dt, res_new, dx, dy, d
+        integer  :: nls
+        real(dp) :: lam
+        real(dp) :: rg, taucap, dt, res_new, dx, dy, d, rms, rms_new
         logical  :: lok
 
         nx = ps%nx; ny = ps%ny; dx = ps%dx; dy = ps%dy
@@ -279,6 +327,7 @@ contains
         ps%H = max(ps%H, 0.0_dp)
         call resid(ps%H, ps%wk%sF)
         res = ncp_norm(nx, ny, ps%H, ps%wk%sF, mask)
+        rms = ncp_rms(nx, ny, ps%H, ps%wk%sF, mask)
         dt = dt0
         n_steps = 0
         lin_fail = 0
@@ -288,15 +337,6 @@ contains
             if (ok) exit
             n_steps = k
 
-            ! active set: H <= dt G (G = F at the start of the step): an explicit pseudo-time
-            ! step would empty the cell
-            !$omp parallel do private(i, j) schedule(static)
-            do j = 1, ny
-                do i = 1, nx
-                    ps%wk%sact(i, j) = mask(i, j) .and. ps%H(i, j) <= dt * ps%wk%sF(i, j)
-                end do
-            end do
-            !$omp end parallel do
 
             ! Jacobian dF_P/dH_K over the 3 x 3 block by 9 coloured residual evaluations
             ps%wk%jl = 0.0_dp
@@ -332,6 +372,22 @@ contains
                 end do
                 !$omp end parallel do
             end do
+
+            ! active set: the cell would empty under its own Newton step,
+            ! H <= G/(1/dt + dF_P/dH_P) (G = F at the start of the step); dt where the
+            ! diagonal is not positive
+            !$omp parallel do private(i, j, d) schedule(static)
+            do j = 1, ny
+                do i = 1, nx
+                    d = 1.0_dp / dt + ps%wk%jl(5, i, j)
+                    if (d > 0.0_dp) then
+                        ps%wk%sact(i, j) = mask(i, j) .and. ps%H(i, j) * d <= ps%wk%sF(i, j)
+                    else
+                        ps%wk%sact(i, j) = mask(i, j) .and. ps%H(i, j) <= dt * ps%wk%sF(i, j)
+                    end if
+                end do
+            end do
+            !$omp end parallel do
 
             ! unknowns: inactive ice cells, column-major
             n = 0
@@ -397,22 +453,35 @@ contains
                 call lin_solve(ps%wk%lin, lin_tol, lin_maxit, use_lis .and. lin_has_lis(), lok)
                 if (.not. lok) lin_fail = lin_fail + 1
             end if
-
-            ! trial: H + d projected on H >= 0 (active cells to 0)
             !$omp parallel do private(i, j) schedule(static)
             do j = 1, ny
                 do i = 1, nx
                     if (.not. mask(i, j)) then
-                        ps%wk%sHt(i, j) = 0.0_dp
-                    else if (ps%wk%sact(i, j)) then
-                        ps%wk%sHt(i, j) = 0.0_dp
+                        ps%wk%sHk(i, j) = 0.0_dp
+                    else if (ps%wk%sact(i, j) .or. ps%wk%sid(i, j) == 0) then
+                        ps%wk%sHk(i, j) = -ps%H(i, j)
                     else
-                        ps%wk%sHt(i, j) = max(ps%H(i, j) + ps%wk%lin%x(ps%wk%sid(i, j)), 0.0_dp)
+                        ps%wk%sHk(i, j) = ps%wk%lin%x(ps%wk%sid(i, j))
                     end if
                 end do
             end do
             !$omp end parallel do
-            call resid(ps%wk%sHt, ps%wk%sFp)
+
+            ! projected backtracking on the rms residual: H(lam) = max(H + lam d, 0)
+            lam = 1.0_dp
+            do nls = 1, 6
+                !$omp parallel do private(i, j) schedule(static)
+                do j = 1, ny
+                    do i = 1, nx
+                        ps%wk%sHt(i, j) = max(ps%H(i, j) + lam * ps%wk%sHk(i, j), 0.0_dp)
+                    end do
+                end do
+                !$omp end parallel do
+                call resid(ps%wk%sHt, ps%wk%sFp)
+                rms_new = ncp_rms(nx, ny, ps%wk%sHt, ps%wk%sFp, mask)
+                if (rms_new <= (1.0_dp - 1.0e-4_dp * lam) * rms) exit
+                lam = 0.5_dp * lam
+            end do
             res_new = ncp_norm(nx, ny, ps%wk%sHt, ps%wk%sFp, mask)
 
             if (verbose) write(*, '(a,i5,a,es9.2,a,es9.2,a,es9.2,a,i7,a,i7,a,i4,a,es9.2)') "  steady ", k, &
@@ -423,21 +492,23 @@ contains
                 write(*, '(a,2i5,a,f10.2,a,es10.3)') "         max |F| at ", loc, " H ", ps%wk%sHt(loc(1), loc(2)), &
                     " F ", ps%wk%sFp(loc(1), loc(2))
             end if
-            if (res_new > 10.0_dp * res .or. res_new /= res_new) then
+            if (rms_new > 10.0_dp * rms .or. rms_new /= rms_new) then
                 dt = 0.5_dp * dt                     ! reject: shorter pseudo-time step
                 if (dt < 1.0e-12_dp * dt0) exit
                 cycle
             end if
             ps%H  = ps%wk%sHt
             ps%wk%sF = ps%wk%sFp
-            ! SER, growing at least 1.5x after a step that did not increase the residual
-            if (res_new <= res) then
-                dt = min(dt * max(res / max(res_new, tiny(1.0_dp)), 1.5_dp), dt_max)
+            ! SER on the rms residual, growing at least 1.5x after a step that did not
+            ! increase it
+            if (rms_new <= rms) then
+                dt = min(dt * max(rms / max(rms_new, tiny(1.0_dp)), 1.5_dp), dt_max)
             else
-                dt = dt * res / res_new
+                dt = dt * rms / rms_new
             end if
             dt = max(dt, dt0 * 1.0e-6_dp)
             res = res_new
+            rms = rms_new
             ok = res < res_tol
         end do
         ! leave s, qx, qy of the final state in the workspace
