@@ -121,6 +121,8 @@ compare: $(objdir)/libplastic.a
 		-L$(objdir) -lplastic $(LIB_LIS) $(LIB_FESMUTILS) $(LIB_NC) $(LFLAGS)
 	$(FC) $(DFLAGS) $(FFLAGS) $(INC_FESMUTILS) -o $(bindir)/smb_sia_proto.x compare/smb_sia_proto.f90 \
 		-L$(objdir) -lplastic $(LIB_LIS) $(LIB_FESMUTILS) $(LIB_NC) $(LFLAGS)
+	$(FC) $(DFLAGS) $(FFLAGS) $(INC_FESMUTILS) -o $(bindir)/bench_threads.x compare/bench_threads.f90 \
+		-L$(objdir) -lplastic $(LIB_LIS) $(LIB_FESMUTILS) $(LIB_NC) $(LFLAGS)
 	$(FC) $(DFLAGS) $(FFLAGS) -o $(bindir)/plastic_native.x compare/native/plastic_native.f90 \
 		-L$(objdir) -lplastic $(LIB_LIS) $(LFLAGS)
 
