@@ -212,9 +212,11 @@ contains
             end do
         end do
 
-        ! The plastic solution is a fixed point of the SMB-driven map.
+        ! The plastic solution is a fixed point of the SMB-driven map (routing: the MFD
+        ! implied SMB above is its closure B).
+        ctrl%method = "routing"
         call plastic_init(pr, nx, ny, dx, dx, pcen)
-        call plastic_solve_smb(pr, z_b, z_sl, smb, mask, r, sl, H_init=H0, stat=st)
+        call plastic_solve_smb(pr, z_b, z_sl, smb, mask, r, sl, ctrl=ctrl, H_init=H0, stat=st)
         write(*, '(a,es10.3,a,i0)') "        fixed point max|H - H0| ", maxval(abs(pr%H - H0), mask=mask), &
             " m, n_outer ", pr%n_outer_used
         call check(st == PLASTIC_OK, "fixed point: converged")
@@ -227,6 +229,10 @@ contains
         call plastic_solve_smb(pr, z_b, z_sl, smb, mask, r, sl, ctrl=ctrl, H_init=H0, stat=st)
         call check(st == PLASTIC_BAD_INPUT, "unknown ctrl%mode -> PLASTIC_BAD_INPUT")
         ctrl = plastic_smb_ctrl_t()
+        ctrl%method = "steep"
+        call plastic_solve_smb(pr, z_b, z_sl, smb, mask, r, sl, ctrl=ctrl, H_init=H0, stat=st)
+        call check(st == PLASTIC_BAD_INPUT, "unknown ctrl%method -> PLASTIC_BAD_INPUT")
+        ctrl%method = "routing"
 
         ! Recovered from a flat 400 m start by the under-relaxed iteration.
         Hg = 0.0_dp
@@ -242,6 +248,7 @@ contains
 
         ! Warm start: after a 5 % change of smb, warm and cold reach the same geometry.
         ctrl = plastic_smb_ctrl_t()
+        ctrl%method = "routing"
         ctrl%tol = 1.0e-2_dp
         call plastic_init(pw, nx, ny, dx, dx, pcen)
         call plastic_init(pc, nx, ny, dx, dx, pcen)
