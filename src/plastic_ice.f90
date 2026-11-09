@@ -10,7 +10,7 @@ module plastic_ice
     use plastic_solver,  only: plastic_t, plastic_init, plastic_solve, plastic_reset, &
                                plastic_end, plastic_volume, plastic_area, &
                                plastic_surface_misfit, plastic_residual, &
-                               plastic_stress_residual, &
+                               plastic_stress_residual, plastic_margin_frac_from_sdist, &
                                PLASTIC_OK, PLASTIC_NOT_CONVERGED, PLASTIC_BAD_INPUT
     use plastic_flow,    only: plastic_glen_t, plastic_sliding_t, &
                                plastic_deformational_velocity, plastic_basal_velocity, &
@@ -28,7 +28,7 @@ module plastic_ice
     public :: plastic_init, plastic_solve, plastic_reset, plastic_end
     public :: plastic_flotation_thickness
     public :: plastic_volume, plastic_area, plastic_surface_misfit, plastic_residual
-    public :: plastic_stress_residual
+    public :: plastic_stress_residual, plastic_margin_frac_from_sdist
     public :: PLASTIC_OK, PLASTIC_NOT_CONVERGED, PLASTIC_BAD_INPUT
     ! closures
     public :: plastic_glen_t, plastic_sliding_t

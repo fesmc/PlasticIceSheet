@@ -15,10 +15,17 @@ module plastic_eikonal
     public :: plastic_par_t
     public :: plastic_flotation_thickness
     public :: godunov_eikonal, godunov_surface
-    public :: sweep_once, sweep_once_surface, sweep_eikonal
+    public :: sweep_once, sweep_eikonal, update_at
+    public :: KERNEL_EIKONAL, KERNEL_SURFACE, MARGIN_DMIN
     public :: grad_central
     public :: flotation_bc, rhs_flat, rhs_full
     public :: godunov_residual, godunov_residual_surface
+
+    integer,  parameter :: KERNEL_EIKONAL = 1, KERNEL_SURFACE = 2
+
+    ! Floor of the spacing factor to an ice-free neighbour, (1 - margin_frac) >= MARGIN_DMIN:
+    ! keeps the update well-conditioned as the margin approaches the ice-cell centre.
+    real(dp), parameter :: MARGIN_DMIN = 0.01_dp
 
     ! Physical constants and solver controls.
     type plastic_par_t
@@ -32,6 +39,10 @@ module plastic_eikonal
         real(dp) :: tol        = 1.0e-6_dp  ! inner early exit, on max decrease of w [m2] (z_s [m] in "surface")
         real(dp) :: outer_tol  = 1.0e-3_dp  ! :full outer exit, on max change of H [m]
         real(dp) :: relax      = 0.5_dp     ! :full under-relaxation in (0,1]
+        ! Margin position between an ice cell and an ice-free neighbour, without margin_frac:
+        ! "face" (half way, margin_frac = 0.5) or "centre" (at the ice-free cell centre,
+        ! margin_frac = 0, as PlasticIceSheet.jl).
+        character(len=8) :: margin = "face"
         ! Warm start: fall back to a cold start when more than this fraction of the
         ! ice cells is new to the mask (see plastic_solve).
         real(dp) :: warm_frac_max = 0.1_dp
@@ -197,19 +208,70 @@ contains
 
     end function godunov_surface
 
+    ! Godunov update at ice cell (i,j) from its four neighbours (clamp-to-edge), with the
+    ! eikonal (kind KERNEL_EIKONAL, F = slowness) or the surface kernel (KERNEL_SURFACE,
+    ! F = tau_b/(rho_i g), zbij the cell's bed). The spacing to a neighbour is d dfac(nb):
+    ! dfac = 1 on ice cells, < 1 on ice-free cells whose margin lies between the two
+    ! centres (sub-cell margin position). With equal spacings on both sides of an axis
+    ! the upwind neighbour is the smaller one; otherwise the axis term is the Godunov
+    ! max_s (u - a_s)+ / d_s over the two sides, i.e. the update is the minimum over the
+    ! side combinations. Each candidate is monotone, so the minimum is.
+    pure function update_at(kind, nx, ny, i, j, u, F, zbij, dfac, dx, dy) result(unew)
+        integer,  intent(in) :: kind, nx, ny, i, j
+        real(dp), intent(in) :: u(nx, ny), F, zbij, dfac(nx, ny), dx, dy
+        real(dp) :: unew, ax(2), dxs(2), ay(2), dys(2), c
+        integer  :: im, ip, jm, jp, nxc, nyc, p, q
+
+        im = max(i - 1, 1)
+        ip = min(i + 1, nx)
+        jm = max(j - 1, 1)
+        jp = min(j + 1, ny)
+        if (dfac(im, j) == dfac(ip, j)) then
+            nxc = 1
+            ax(1)  = min(u(im, j), u(ip, j))
+            dxs(1) = dx * dfac(im, j)
+        else
+            nxc = 2
+            ax(1) = u(im, j); dxs(1) = dx * dfac(im, j)
+            ax(2) = u(ip, j); dxs(2) = dx * dfac(ip, j)
+        end if
+        if (dfac(i, jm) == dfac(i, jp)) then
+            nyc = 1
+            ay(1)  = min(u(i, jm), u(i, jp))
+            dys(1) = dy * dfac(i, jm)
+        else
+            nyc = 2
+            ay(1) = u(i, jm); dys(1) = dy * dfac(i, jm)
+            ay(2) = u(i, jp); dys(2) = dy * dfac(i, jp)
+        end if
+
+        unew = BIG
+        do q = 1, nyc
+            do p = 1, nxc
+                if (kind == KERNEL_EIKONAL) then
+                    c = godunov_eikonal(ax(p), dxs(p), ay(q), dys(q), F)
+                else
+                    c = godunov_surface(ax(p), dxs(p), ay(q), dys(q), zbij, F)
+                end if
+                unew = min(unew, c)
+            end do
+        end do
+    end function update_at
+
     ! One Gauss-Seidel sweep in the ordering (xdir, ydir) = (+-1, +-1). Updates ice
-    ! cells only, keeps the monotone min, and returns the largest decrease of u.
-    ! Cells outside the array are clamped to the edge.
-    function sweep_once(nx, ny, u, F, mask, dx, dy, xdir, ydir) result(change)
-        integer,  intent(in)    :: nx, ny
+    ! cells only, keeps the monotone min, and returns the largest decrease of u. Cells
+    ! with equal spacing on both sides of each axis (all but those at a sub-cell margin)
+    ! take the single-candidate update inline; the others go through update_at.
+    function sweep_once(kind, nx, ny, u, F, zb, mask, dfac, dx, dy, xdir, ydir) result(change)
+        integer,  intent(in)    :: kind, nx, ny
         real(dp), intent(inout) :: u(nx, ny)
-        real(dp), intent(in)    :: F(nx, ny)
+        real(dp), intent(in)    :: F(nx, ny), zb(nx, ny), dfac(nx, ny)
         logical,  intent(in)    :: mask(nx, ny)
         real(dp), intent(in)    :: dx, dy
         integer,  intent(in)    :: xdir, ydir
         real(dp) :: change
         integer  :: i, j, i0, i1, j0, j1, im, ip, jm, jp
-        real(dp) :: a, b, unew
+        real(dp) :: unew, a, b
 
         if (xdir > 0) then
             i0 = 1;  i1 = nx
@@ -230,9 +292,17 @@ contains
                 if (.not. mask(i, j)) cycle
                 im = max(i - 1, 1)
                 ip = min(i + 1, nx)
-                a = min(u(im, j), u(ip, j))
-                b = min(u(i, jm), u(i, jp))
-                unew = godunov_eikonal(a, dx, b, dy, F(i, j))
+                if (dfac(im, j) == dfac(ip, j) .and. dfac(i, jm) == dfac(i, jp)) then
+                    a = min(u(im, j), u(ip, j))
+                    b = min(u(i, jm), u(i, jp))
+                    if (kind == KERNEL_EIKONAL) then
+                        unew = godunov_eikonal(a, dx * dfac(im, j), b, dy * dfac(i, jm), F(i, j))
+                    else
+                        unew = godunov_surface(a, dx * dfac(im, j), b, dy * dfac(i, jm), zb(i, j), F(i, j))
+                    end if
+                else
+                    unew = update_at(kind, nx, ny, i, j, u, F(i, j), zb(i, j), dfac, dx, dy)
+                end if
                 if (unew < u(i, j)) then
                     change  = max(change, u(i, j) - unew)
                     u(i, j) = unew
@@ -241,58 +311,16 @@ contains
         end do
     end function sweep_once
 
-    ! sweep_once for the surface equation: u = z_s, K = tau_b/(rho_i g), zb the bed.
-    function sweep_once_surface(nx, ny, u, K, zb, mask, dx, dy, xdir, ydir) result(change)
-        integer,  intent(in)    :: nx, ny
-        real(dp), intent(inout) :: u(nx, ny)
-        real(dp), intent(in)    :: K(nx, ny), zb(nx, ny)
-        logical,  intent(in)    :: mask(nx, ny)
-        real(dp), intent(in)    :: dx, dy
-        integer,  intent(in)    :: xdir, ydir
-        real(dp) :: change
-        integer  :: i, j, i0, i1, j0, j1, im, ip, jm, jp
-        real(dp) :: a, b, unew
-
-        if (xdir > 0) then
-            i0 = 1;  i1 = nx
-        else
-            i0 = nx; i1 = 1
-        end if
-        if (ydir > 0) then
-            j0 = 1;  j1 = ny
-        else
-            j0 = ny; j1 = 1
-        end if
-
-        change = 0.0_dp
-        do j = j0, j1, ydir
-            jm = max(j - 1, 1)
-            jp = min(j + 1, ny)
-            do i = i0, i1, xdir
-                if (.not. mask(i, j)) cycle
-                im = max(i - 1, 1)
-                ip = min(i + 1, nx)
-                a = min(u(im, j), u(ip, j))
-                b = min(u(i, jm), u(i, jp))
-                unew = godunov_surface(a, dx, b, dy, zb(i, j), K(i, j))
-                if (unew < u(i, j)) then
-                    change  = max(change, u(i, j) - unew)
-                    u(i, j) = unew
-                end if
-            end do
-        end do
-    end function sweep_once_surface
-
     ! Solve |grad u| = F on the ice cells (mask), with Dirichlet values bc on the
-    ! ice-free cells. u starts from BIG on ice cells (the monotone scheme only
-    ! decreases u). The four diagonal orderings alternate; the early exit needs a
-    ! full cycle of four. Returns the number of sweeps and whether tol was reached.
-    ! With zb present, solves the surface equation instead (u = z_s, F = tau_b/(rho_i g),
-    ! see godunov_surface).
-    subroutine sweep_eikonal(nx, ny, u, F, mask, bc, dx, dy, max_sweeps, tol, n_sweeps, ok, zb)
+    ! ice-free cells, placed at d dfac from the neighbouring ice-cell centres. u starts
+    ! from BIG on ice cells (the monotone scheme only decreases u). The four diagonal
+    ! orderings alternate; the early exit needs a full cycle of four. Returns the number
+    ! of sweeps and whether tol was reached. With zb present, solves the surface
+    ! equation instead (u = z_s, F = tau_b/(rho_i g), see godunov_surface).
+    subroutine sweep_eikonal(nx, ny, u, F, mask, bc, dfac, dx, dy, max_sweeps, tol, n_sweeps, ok, zb)
         integer,  intent(in)  :: nx, ny
         real(dp), intent(out) :: u(nx, ny)
-        real(dp), intent(in)  :: F(nx, ny), bc(nx, ny)
+        real(dp), intent(in)  :: F(nx, ny), bc(nx, ny), dfac(nx, ny)
         logical,  intent(in)  :: mask(nx, ny)
         real(dp), intent(in)  :: dx, dy, tol
         integer,  intent(in)  :: max_sweeps
@@ -319,9 +347,9 @@ contains
         do s = 1, max_sweeps
             k = mod(s - 1, 4) + 1
             if (present(zb)) then
-                change = sweep_once_surface(nx, ny, u, F, zb, mask, dx, dy, xd(k), yd(k))
+                change = sweep_once(KERNEL_SURFACE, nx, ny, u, F, zb, mask, dfac, dx, dy, xd(k), yd(k))
             else
-                change = sweep_once(nx, ny, u, F, mask, dx, dy, xd(k), yd(k))
+                change = sweep_once(KERNEL_EIKONAL, nx, ny, u, F, F, mask, dfac, dx, dy, xd(k), yd(k))
             end if
             n_sweeps = s
             if (s >= 4 .and. change < tol) then
@@ -430,26 +458,20 @@ contains
         end do
     end subroutine rhs_full
 
-    ! Godunov residual of a field w for the right-hand side F: w - (Godunov update)
-    ! on ice cells, w - bc on ice-free cells. Zero at a converged solution.
-    subroutine godunov_residual(nx, ny, w, F, mask, bc, dx, dy, r)
+    ! Godunov residual of a field w for the right-hand side F: w - (Godunov update) on
+    ! ice cells, w - bc on ice-free cells. Zero at a converged solution.
+    subroutine godunov_residual(nx, ny, w, F, mask, bc, dfac, dx, dy, r)
         integer,  intent(in)  :: nx, ny
-        real(dp), intent(in)  :: w(nx, ny), F(nx, ny), bc(nx, ny), dx, dy
+        real(dp), intent(in)  :: w(nx, ny), F(nx, ny), bc(nx, ny), dfac(nx, ny), dx, dy
         logical,  intent(in)  :: mask(nx, ny)
         real(dp), intent(out) :: r(nx, ny)
-        integer  :: i, j, im, ip, jm, jp
-        real(dp) :: a, b
+        integer :: i, j
 
         do j = 1, ny
-            jm = max(j - 1, 1)
-            jp = min(j + 1, ny)
             do i = 1, nx
                 if (mask(i, j)) then
-                    im = max(i - 1, 1)
-                    ip = min(i + 1, nx)
-                    a = min(w(im, j), w(ip, j))
-                    b = min(w(i, jm), w(i, jp))
-                    r(i, j) = w(i, j) - godunov_eikonal(a, dx, b, dy, F(i, j))
+                    r(i, j) = w(i, j) - update_at(KERNEL_EIKONAL, nx, ny, i, j, w, F(i, j), 0.0_dp, &
+                                                  dfac, dx, dy)
                 else
                     r(i, j) = w(i, j) - bc(i, j)
                 end if
@@ -459,24 +481,18 @@ contains
 
     ! Godunov residual of the surface equation: u - (surface update) on ice cells,
     ! u - bc on ice-free cells (u = z_s, K = tau_b/(rho_i g), bc = z_b + H_flt).
-    subroutine godunov_residual_surface(nx, ny, u, K, zb, mask, bc, dx, dy, r)
+    subroutine godunov_residual_surface(nx, ny, u, K, zb, mask, bc, dfac, dx, dy, r)
         integer,  intent(in)  :: nx, ny
-        real(dp), intent(in)  :: u(nx, ny), K(nx, ny), zb(nx, ny), bc(nx, ny), dx, dy
+        real(dp), intent(in)  :: u(nx, ny), K(nx, ny), zb(nx, ny), bc(nx, ny), dfac(nx, ny), dx, dy
         logical,  intent(in)  :: mask(nx, ny)
         real(dp), intent(out) :: r(nx, ny)
-        integer  :: i, j, im, ip, jm, jp
-        real(dp) :: a, b
+        integer :: i, j
 
         do j = 1, ny
-            jm = max(j - 1, 1)
-            jp = min(j + 1, ny)
             do i = 1, nx
                 if (mask(i, j)) then
-                    im = max(i - 1, 1)
-                    ip = min(i + 1, nx)
-                    a = min(u(im, j), u(ip, j))
-                    b = min(u(i, jm), u(i, jp))
-                    r(i, j) = u(i, j) - godunov_surface(a, dx, b, dy, zb(i, j), K(i, j))
+                    r(i, j) = u(i, j) - update_at(KERNEL_SURFACE, nx, ny, i, j, u, K(i, j), zb(i, j), &
+                                                  dfac, dx, dy)
                 else
                     r(i, j) = u(i, j) - bc(i, j)
                 end if

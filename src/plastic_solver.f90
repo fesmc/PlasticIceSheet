@@ -14,7 +14,8 @@ module plastic_solver
     public :: plastic_t, plastic_work_t
     public :: plastic_init, plastic_solve, plastic_reset, plastic_end
     public :: plastic_volume, plastic_area, plastic_surface_misfit, plastic_residual
-    public :: plastic_stress_residual
+    public :: plastic_stress_residual, plastic_margin_frac_from_sdist
+    public :: margin_spacing
     public :: PLASTIC_OK, PLASTIC_NOT_CONVERGED, PLASTIC_BAD_INPUT
     public :: check_shape, cold_flat_solve, finalize_geometry, warm_start_cells
 
@@ -31,6 +32,7 @@ module plastic_solver
         real(dp), allocatable :: bc(:,:)    ! margin values H_flt^2
         real(dp), allocatable :: zbx(:,:), zby(:,:)   ! bed gradient
         logical,  allocatable :: mask_prev(:,:)       ! mask of the stored solution
+        real(dp), allocatable :: dfac(:,:)            ! spacing factor to each cell as a neighbour
         ! closures (plastic_flow, plastic_reconstruct)
         real(dp), allocatable :: ex(:,:), ey(:,:)     ! unit flow direction
         real(dp), allocatable :: f1(:,:), f2(:,:)     ! scratch: flux, inflow / driving stress
@@ -88,7 +90,7 @@ contains
         ps%z_srf = 0.0_dp
 
         allocate(ps%wk%G(nx, ny), ps%wk%F(nx, ny), ps%wk%wc(nx, ny), ps%wk%bc(nx, ny))
-        allocate(ps%wk%zbx(nx, ny), ps%wk%zby(nx, ny), ps%wk%mask_prev(nx, ny))
+        allocate(ps%wk%zbx(nx, ny), ps%wk%zby(nx, ny), ps%wk%mask_prev(nx, ny), ps%wk%dfac(nx, ny))
         ps%wk%mask_prev = .false.
         allocate(ps%wk%ex(nx, ny), ps%wk%ey(nx, ny), ps%wk%f1(nx, ny), ps%wk%f2(nx, ny))
         allocate(ps%wk%idx(nx*ny), ps%wk%ti(nx*ny), ps%wk%key(nx*ny), ps%wk%tk(nx*ny))
@@ -118,6 +120,7 @@ contains
         if (allocated(ps%wk%zbx))       deallocate(ps%wk%zbx)
         if (allocated(ps%wk%zby))       deallocate(ps%wk%zby)
         if (allocated(ps%wk%mask_prev)) deallocate(ps%wk%mask_prev)
+        if (allocated(ps%wk%dfac))      deallocate(ps%wk%dfac)
         if (allocated(ps%wk%ex))        deallocate(ps%wk%ex)
         if (allocated(ps%wk%ey))        deallocate(ps%wk%ey)
         if (allocated(ps%wk%f1))        deallocate(ps%wk%f1)
@@ -151,12 +154,13 @@ contains
     ! +BIG on the ice cells, as the monotone scheme requires.
     !
     ! Non-convergence does not abort: ps%converged, ps%stat and ps%msg report it.
-    subroutine plastic_solve(ps, z_bed, z_sl, tau_b, mask, warm, stat)
-        type(plastic_t),   intent(inout) :: ps
-        real(dp),          intent(in)    :: z_bed(:,:), z_sl(:,:), tau_b(:,:)
-        logical,           intent(in)    :: mask(:,:)
-        logical, optional, intent(in)    :: warm
-        integer, optional, intent(out)   :: stat
+    subroutine plastic_solve(ps, z_bed, z_sl, tau_b, mask, warm, stat, margin_frac)
+        type(plastic_t),    intent(inout) :: ps
+        real(dp),           intent(in)    :: z_bed(:,:), z_sl(:,:), tau_b(:,:)
+        logical,            intent(in)    :: mask(:,:)
+        logical,  optional, intent(in)    :: warm
+        integer,  optional, intent(out)   :: stat
+        real(dp), optional, intent(in)    :: margin_frac(:,:)
 
         integer  :: nx, ny, it, i, j, ns, n_new, n_ice
         logical  :: full, want_warm, inner_ok, ok, outer_ok
@@ -165,6 +169,7 @@ contains
         ps%stat = PLASTIC_OK
         ps%msg  = ""
         call check_inputs(ps, z_bed, z_sl, tau_b, mask)
+        call margin_spacing(ps, mask, margin_frac)
         if (ps%stat /= PLASTIC_OK) then
             ps%converged = .false.
             if (present(stat)) stat = ps%stat
@@ -193,7 +198,7 @@ contains
         call rhs_flat(nx, ny, tau_b, ps%par, ps%wk%G)
 
         if (.not. full) then
-            call sweep_eikonal(nx, ny, ps%w, ps%wk%G, mask, ps%wk%bc, ps%dx, ps%dy, &
+            call sweep_eikonal(nx, ny, ps%w, ps%wk%G, mask, ps%wk%bc, ps%wk%dfac, ps%dx, ps%dy, &
                                ps%par%max_sweeps, ps%par%tol, ns, ok)
             ps%n_sweeps = ns
             ps%converged = ok
@@ -231,7 +236,7 @@ contains
             do it = 1, ps%par%n_outer
                 call rhs_full(nx, ny, ps%w, ps%wk%G, ps%wk%zbx, ps%wk%zby, ps%dx, ps%dy, &
                               ps%par%H_min, ps%wk%F)
-                call sweep_eikonal(nx, ny, ps%wk%wc, ps%wk%F, mask, ps%wk%bc, ps%dx, ps%dy, &
+                call sweep_eikonal(nx, ny, ps%wk%wc, ps%wk%F, mask, ps%wk%bc, ps%wk%dfac, ps%dx, ps%dy, &
                                    ps%par%max_sweeps, ps%par%tol, ns, ok)
                 ps%n_sweeps = ps%n_sweeps + ns
                 inner_ok = inner_ok .and. ok
@@ -281,7 +286,7 @@ contains
         ps%n_new_cells  = 0
 
         call surface_bc(ps, z_bed, z_sl, tau_b)
-        call sweep_eikonal(nx, ny, ps%wk%wc, ps%wk%G, mask, ps%wk%bc, ps%dx, ps%dy, &
+        call sweep_eikonal(nx, ny, ps%wk%wc, ps%wk%G, mask, ps%wk%bc, ps%wk%dfac, ps%dx, ps%dy, &
                            ps%par%max_sweeps, ps%par%tol, ns, ok, zb=z_bed)
         ps%n_sweeps  = ns
         ps%converged = ok
@@ -354,7 +359,7 @@ contains
         integer :: ns
         logical :: ok1
 
-        call sweep_eikonal(ps%nx, ps%ny, u, ps%wk%G, mask, ps%wk%bc, ps%dx, ps%dy, &
+        call sweep_eikonal(ps%nx, ps%ny, u, ps%wk%G, mask, ps%wk%bc, ps%wk%dfac, ps%dx, ps%dy, &
                            ps%par%max_sweeps, ps%par%tol, ns, ok1)
         ps%n_sweeps = ps%n_sweeps + ns
         ok = ok .and. ok1
@@ -485,12 +490,13 @@ contains
     ! Godunov residual of the stored solution for the current par%mode (convergence
     ! check): r = w - (Godunov update) on ice cells, w - H_flt^2 elsewhere (in mode
     ! "surface" the same for z_s, with z_bed + H_flt); ~0 when converged.
-    subroutine plastic_residual(ps, z_bed, z_sl, tau_b, mask, r, stat)
-        type(plastic_t),   intent(inout) :: ps
-        real(dp),          intent(in)    :: z_bed(:,:), z_sl(:,:), tau_b(:,:)
-        logical,           intent(in)    :: mask(:,:)
-        real(dp),          intent(out)   :: r(:,:)
-        integer, optional, intent(out)   :: stat
+    subroutine plastic_residual(ps, z_bed, z_sl, tau_b, mask, r, stat, margin_frac)
+        type(plastic_t),    intent(inout) :: ps
+        real(dp),           intent(in)    :: z_bed(:,:), z_sl(:,:), tau_b(:,:)
+        logical,            intent(in)    :: mask(:,:)
+        real(dp),           intent(out)   :: r(:,:)
+        integer,  optional, intent(out)   :: stat
+        real(dp), optional, intent(in)    :: margin_frac(:,:)
         integer :: nx, ny, stat_solve
         character(len=MSG_LEN) :: msg_solve
 
@@ -500,6 +506,7 @@ contains
         ps%stat = PLASTIC_OK
         call check_inputs(ps, z_bed, z_sl, tau_b, mask)
         call check_shape(ps, size(r, 1), size(r, 2), "r")
+        call margin_spacing(ps, mask, margin_frac)
         if (present(stat)) stat = ps%stat
         if (ps%stat /= PLASTIC_OK) return
         ps%stat = stat_solve
@@ -511,7 +518,7 @@ contains
             call surface_bc(ps, z_bed, z_sl, tau_b)
             call surface_field(ps, mask, ps%wk%wc)
             call godunov_residual_surface(nx, ny, ps%wk%wc, ps%wk%G, z_bed, mask, ps%wk%bc, &
-                                          ps%dx, ps%dy, r)
+                                          ps%wk%dfac, ps%dx, ps%dy, r)
             return
         end if
         call flotation_bc(nx, ny, z_bed, z_sl, ps%par, ps%wk%bc)
@@ -520,9 +527,9 @@ contains
             call grad_central(nx, ny, z_bed, ps%dx, ps%dy, ps%wk%zbx, ps%wk%zby)
             call rhs_full(nx, ny, ps%w, ps%wk%G, ps%wk%zbx, ps%wk%zby, ps%dx, ps%dy, &
                           ps%par%H_min, ps%wk%F)
-            call godunov_residual(nx, ny, ps%w, ps%wk%F, mask, ps%wk%bc, ps%dx, ps%dy, r)
+            call godunov_residual(nx, ny, ps%w, ps%wk%F, mask, ps%wk%bc, ps%wk%dfac, ps%dx, ps%dy, r)
         else
-            call godunov_residual(nx, ny, ps%w, ps%wk%G, mask, ps%wk%bc, ps%dx, ps%dy, r)
+            call godunov_residual(nx, ny, ps%w, ps%wk%G, mask, ps%wk%bc, ps%wk%dfac, ps%dx, ps%dy, r)
         end if
     end subroutine plastic_residual
 
@@ -546,19 +553,20 @@ contains
 
     ! Stress residual of the stored geometry (any mode): on ice cells with tau_b > 0
     ! and H > 0, r = | |grad z_s| rho_i g H - tau_b | / tau_b, with the Godunov upwind
-    ! gradient |grad z_s|^2 = ((z_s - a)+/dx)^2 + ((z_s - b)+/dy)^2 (a, b the lower
-    ! neighbour surfaces; z_bed + H_flt on ice-free neighbours). rmax = max r; r = 0
+    ! gradient |grad z_s|^2 = (max_s (z_s - a_s)+/d_s)^2 + (same in y) over the two sides
+    ! (z_bed + H_flt on ice-free neighbours, at the margin spacing). rmax = max r; r = 0
     ! elsewhere. A cell-centred measure: on the exact Nye profile it is O(1) at the first
     ! ice cell (the one-sided slope of a sqrt profile), so read it away from the margin.
-    subroutine plastic_stress_residual(ps, z_bed, z_sl, tau_b, mask, rmax, r, stat)
+    subroutine plastic_stress_residual(ps, z_bed, z_sl, tau_b, mask, rmax, r, stat, margin_frac)
         type(plastic_t),    intent(inout) :: ps
         real(dp),           intent(in)    :: z_bed(:,:), z_sl(:,:), tau_b(:,:)
         logical,            intent(in)    :: mask(:,:)
         real(dp),           intent(out)   :: rmax
         real(dp), optional, intent(out)   :: r(:,:)
         integer,  optional, intent(out)   :: stat
+        real(dp), optional, intent(in)    :: margin_frac(:,:)
         integer  :: i, j, im, ip, jm, jp, stat_solve
-        real(dp) :: a, b, u, gx, gy, rr, rg
+        real(dp) :: u, gx, gy, rr, rg
         character(len=MSG_LEN) :: msg_solve
 
         stat_solve = ps%stat
@@ -566,6 +574,7 @@ contains
         ps%stat = PLASTIC_OK
         call check_inputs(ps, z_bed, z_sl, tau_b, mask)
         if (present(r)) call check_shape(ps, size(r, 1), size(r, 2), "r")
+        call margin_spacing(ps, mask, margin_frac)
         if (present(stat)) stat = ps%stat
         rmax = 0.0_dp
         if (ps%stat /= PLASTIC_OK) return
@@ -584,10 +593,10 @@ contains
                     im = max(i - 1, 1)
                     ip = min(i + 1, ps%nx)
                     u  = ps%wk%wc(i, j)
-                    a  = min(ps%wk%wc(im, j), ps%wk%wc(ip, j))
-                    b  = min(ps%wk%wc(i, jm), ps%wk%wc(i, jp))
-                    gx = max(u - a, 0.0_dp) / ps%dx
-                    gy = max(u - b, 0.0_dp) / ps%dy
+                    gx = max(u - ps%wk%wc(im, j), 0.0_dp) / (ps%dx * ps%wk%dfac(im, j))
+                    gx = max(gx, max(u - ps%wk%wc(ip, j), 0.0_dp) / (ps%dx * ps%wk%dfac(ip, j)))
+                    gy = max(u - ps%wk%wc(i, jm), 0.0_dp) / (ps%dy * ps%wk%dfac(i, jm))
+                    gy = max(gy, max(u - ps%wk%wc(i, jp), 0.0_dp) / (ps%dy * ps%wk%dfac(i, jp)))
                     rr = abs(sqrt(gx * gx + gy * gy) * rg * ps%H(i, j) - tau_b(i, j)) / tau_b(i, j)
                 end if
                 rmax = max(rmax, rr)
@@ -595,5 +604,79 @@ contains
             end do
         end do
     end subroutine plastic_stress_residual
+
+    ! Spacing factor ps%wk%dfac to each cell as a neighbour: 1 on ice cells; on ice-free
+    ! cells max(1 - f, MARGIN_DMIN), f = margin_frac if given, else 0.5 (par%margin =
+    ! "face") or 0 ("centre"). PLASTIC_BAD_INPUT for an unknown par%margin, a wrong shape,
+    ! or margin_frac not in [0, 1) on an ice-free cell. Does nothing if ps%stat is
+    ! already an error.
+    subroutine margin_spacing(ps, mask, margin_frac)
+        type(plastic_t),    intent(inout) :: ps
+        logical,            intent(in)    :: mask(:,:)
+        real(dp), optional, intent(in)    :: margin_frac(:,:)
+        integer  :: i, j
+        real(dp) :: f0
+
+        if (ps%stat /= PLASTIC_OK) return
+        if (trim(ps%par%margin) /= "face" .and. trim(ps%par%margin) /= "centre") then
+            ps%stat = PLASTIC_BAD_INPUT
+            ps%msg  = 'plastic: par%margin must be "face" or "centre"'
+            return
+        end if
+        if (present(margin_frac)) then
+            call check_shape(ps, size(margin_frac, 1), size(margin_frac, 2), "margin_frac")
+            if (ps%stat /= PLASTIC_OK) return
+            do j = 1, ps%ny
+                do i = 1, ps%nx
+                    if (mask(i, j)) cycle
+                    if (.not. (margin_frac(i, j) >= 0.0_dp .and. margin_frac(i, j) < 1.0_dp)) then
+                        ps%stat = PLASTIC_BAD_INPUT
+                        ps%msg  = "plastic: margin_frac must be in [0,1) on ice-free cells"
+                        return
+                    end if
+                end do
+            end do
+        end if
+        f0 = 0.0_dp
+        if (trim(ps%par%margin) == "face") f0 = 0.5_dp
+        do j = 1, ps%ny
+            do i = 1, ps%nx
+                if (mask(i, j)) then
+                    ps%wk%dfac(i, j) = 1.0_dp
+                else if (present(margin_frac)) then
+                    ps%wk%dfac(i, j) = max(1.0_dp - margin_frac(i, j), MARGIN_DMIN)
+                else
+                    ps%wk%dfac(i, j) = max(1.0_dp - f0, MARGIN_DMIN)
+                end if
+            end do
+        end do
+    end subroutine margin_spacing
+
+    ! margin_frac from the signed distance to the margin, sdist [m], positive in the ice,
+    ! negative outside, at the cell centres: on an ice-free cell with an ice neighbour,
+    ! frac = -sdist / h clamped to [0, 1 - MARGIN_DMIN], h = sqrt(dx dy) (= dx on a square
+    ! grid); 0 elsewhere. The margin is then at (1 - frac) d from the centre of each
+    ! neighbouring ice cell (isotropic: exact for margins along a grid axis).
+    subroutine plastic_margin_frac_from_sdist(sdist, mask, dx, dy, frac)
+        real(dp), intent(in)  :: sdist(:,:), dx, dy
+        logical,  intent(in)  :: mask(:,:)
+        real(dp), intent(out) :: frac(:,:)
+        integer  :: nx, ny, i, j
+        real(dp) :: h
+        logical  :: next_to_ice
+
+        nx = size(mask, 1)
+        ny = size(mask, 2)
+        h = sqrt(dx * dy)
+        do j = 1, ny
+            do i = 1, nx
+                frac(i, j) = 0.0_dp
+                if (mask(i, j)) cycle
+                next_to_ice = mask(max(i-1,1), j) .or. mask(min(i+1,nx), j) .or. &
+                              mask(i, max(j-1,1)) .or. mask(i, min(j+1,ny))
+                if (next_to_ice) frac(i, j) = min(max(-sdist(i, j) / h, 0.0_dp), 1.0_dp - MARGIN_DMIN)
+            end do
+        end do
+    end subroutine plastic_margin_frac_from_sdist
 
 end module plastic_solver

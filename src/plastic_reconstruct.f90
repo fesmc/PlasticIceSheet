@@ -12,7 +12,7 @@ module plastic_reconstruct
 
     use plastic_kinds,   only: dp, BIG
     use plastic_eikonal, only: flotation_bc, sweep_eikonal, plastic_flotation_thickness
-    use plastic_solver,  only: plastic_t, check_shape, warm_start_cells, &
+    use plastic_solver,  only: plastic_t, check_shape, warm_start_cells, margin_spacing, &
                                PLASTIC_OK, PLASTIC_NOT_CONVERGED, PLASTIC_BAD_INPUT
     use plastic_flow,    only: plastic_glen_t, plastic_sliding_t, LAW_COULOMB, &
                                sliding_law_code, basal_velocity_code, deformational_velocity, &
@@ -100,7 +100,7 @@ contains
     ! tau_d (optional) returns the derived driving stress [Pa] of the last iteration.
     ! Non-convergence does not abort: ps%converged, ps%stat and ps%msg report it.
     subroutine plastic_solve_smb(ps, z_bed, z_sl, smb, mask, rheo, slide, warm, ctrl, &
-                                 H_init, tau_d, stat)
+                                 H_init, tau_d, stat, margin_frac)
         type(plastic_t),                    intent(inout) :: ps
         real(dp),                           intent(in)    :: z_bed(:,:), z_sl(:,:), smb(:,:)
         logical,                            intent(in)    :: mask(:,:)
@@ -111,6 +111,7 @@ contains
         real(dp),                 optional, intent(in)    :: H_init(:,:)
         real(dp),                 optional, intent(out)   :: tau_d(:,:)
         integer,                  optional, intent(out)   :: stat
+        real(dp),                 optional, intent(in)    :: margin_frac(:,:)
 
         type(plastic_smb_ctrl_t) :: c
         integer  :: nx, ny, i, j, it, code, n_new, n_ice, n_unreached
@@ -143,6 +144,7 @@ contains
             call check_shape(ps, size(mask, 1),  size(mask, 2),  "mask")
             if (present(H_init)) call check_shape(ps, size(H_init, 1), size(H_init, 2), "H_init")
             if (present(tau_d))  call check_shape(ps, size(tau_d, 1),  size(tau_d, 2),  "tau_d")
+            call margin_spacing(ps, mask, margin_frac)
         end if
         if (ps%stat /= PLASTIC_OK) then
             ps%converged = .false.
@@ -318,11 +320,11 @@ contains
             logical :: ok0
             if (surf) then
                 ps%wk%G = tau / rg
-                call sweep_eikonal(nx, ny, u, ps%wk%G, mask, ps%wk%bc, ps%dx, ps%dy, &
+                call sweep_eikonal(nx, ny, u, ps%wk%G, mask, ps%wk%bc, ps%wk%dfac, ps%dx, ps%dy, &
                                    c%max_sweeps, c%sweep_tol, ns0, ok0, zb=z_bed)
             else
                 ps%wk%G = 2.0_dp * tau / rg
-                call sweep_eikonal(nx, ny, u, ps%wk%G, mask, ps%wk%bc, ps%dx, ps%dy, &
+                call sweep_eikonal(nx, ny, u, ps%wk%G, mask, ps%wk%bc, ps%wk%dfac, ps%dx, ps%dy, &
                                    c%max_sweeps, c%sweep_tol, ns0, ok0)
             end if
             ps%n_sweeps = ps%n_sweeps + ns0
