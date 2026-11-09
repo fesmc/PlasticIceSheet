@@ -14,6 +14,8 @@ module plastic_reconstruct
     use plastic_eikonal, only: flotation_bc, sweep_eikonal, plastic_flotation_thickness
     use plastic_solver,  only: plastic_t, check_shape, warm_start_cells, margin_spacing, &
                                PLASTIC_OK, PLASTIC_NOT_CONVERGED, PLASTIC_BAD_INPUT
+    use plastic_steady,  only: steady_solve, steady_tau
+    use plastic_linsolve, only: lin_has_lis
     use plastic_flow,    only: plastic_glen_t, plastic_sliding_t, LAW_COULOMB, &
                                sliding_law_code, basal_velocity_code, deformational_velocity, &
                                balance_flux_core
@@ -23,8 +25,24 @@ module plastic_reconstruct
     private
     public :: plastic_smb_ctrl_t, plastic_solve_smb, plastic_invert_driving_stress
 
-    ! Controls of plastic_solve_smb (defaults as diva_reconstruct, except mode).
+    ! Controls of plastic_solve_smb.
     type plastic_smb_ctrl_t
+        ! "steady": steady mass conservation solved directly (plastic_steady);
+        ! "routing": the PlasticIceSheet.jl iteration (route, invert, sweep, relax),
+        ! conditionally stable (relax < 2/(1 - lambda), lambda ~ -H/(slope dx)).
+        character(len=8) :: method = "steady"
+        ! steady: complementarity residual tolerance [m/yr], pseudo-time steps cap, initial
+        ! and maximum pseudo-time step [yr], linear solver ("auto": Lis if built with lis=1,
+        ! else built-in; "lis"; "builtin"), its relative tolerance and iteration cap
+        real(dp) :: res_tol    = 1.0e-6_dp
+        integer  :: n_steady   = 500
+        real(dp) :: dt0        = 1.0_dp
+        real(dp) :: dt_max     = 1.0e8_dp
+        character(len=8) :: lin = "auto"
+        real(dp) :: lin_tol    = 1.0e-8_dp
+        integer  :: lin_maxit  = 2000
+        logical  :: verbose    = .false.     ! print the steady iteration
+        ! routing (defaults as diva_reconstruct) and the cold start
         character(len=8) :: mode = "surface"  ! inner plastic solve: "surface" | "flat" (Julia parity)
         integer  :: n_outer    = 1000       ! outer iterations cap
         real(dp) :: relax      = 0.05_dp    ! under-relaxation in (0,1]
@@ -89,16 +107,19 @@ contains
 
     ! SMB-driven reconstruction of H, z_srf (and w = H^2) on ps, from bed z_bed, sea
     ! level z_sl, smb [m ice / yr] and the grounded-ice mask, for the DIVA flux law
-    ! (rheo, slide). The inner plastic solve is ctrl%mode: "surface" (default; the bed
-    ! relief in full, see plastic_solve) or "flat" (as PlasticIceSheet.jl).
+    ! (rheo, slide). ctrl%method "steady" (default) solves steady mass conservation with
+    ! H >= 0 directly (plastic_steady); "routing" is the PlasticIceSheet.jl iteration,
+    ! whose inner plastic solve is ctrl%mode ("surface" or "flat").
     !
     ! Start: H_init if given; else, with warm=.true. and a stored solution, the stored
     ! H on cells that were ice before and a cold-start value on the new cells (cold
-    ! start if more than par%warm_frac_max of the ice cells are new); else cold, a flat
-    ! solve at the uniform tau_b = ctrl%tau_init.
+    ! start if more than par%warm_frac_max of the ice cells are new); else cold, a plastic
+    ! solve (ctrl%mode) at the uniform tau_b = ctrl%tau_init.
     !
-    ! tau_d (optional) returns the derived driving stress [Pa] of the last iteration.
-    ! Non-convergence does not abort: ps%converged, ps%stat and ps%msg report it.
+    ! tau_d (optional) returns the driving stress [Pa]: derived per cell (routing) or
+    ! rho_i g H |grad z_s| of the result (steady). margin_frac / par%margin set the margin
+    ! position (plastic_solve). Non-convergence does not abort: ps%converged, ps%stat
+    ! and ps%msg report it.
     subroutine plastic_solve_smb(ps, z_bed, z_sl, smb, mask, rheo, slide, warm, ctrl, &
                                  H_init, tau_d, stat, margin_frac)
         type(plastic_t),                    intent(inout) :: ps
@@ -114,7 +135,7 @@ contains
         real(dp),                 optional, intent(in)    :: margin_frac(:,:)
 
         type(plastic_smb_ctrl_t) :: c
-        integer  :: nx, ny, i, j, it, code, n_new, n_ice, n_unreached
+        integer  :: nx, ny, i, j, it, code, n_new, n_ice, n_unreached, n_lin_fail
         logical  :: inner_ok, outer_ok, start_warm, surf
         real(dp) :: rg, wf, delta, Hn, r
         character(len=32) :: s
@@ -131,6 +152,15 @@ contains
         else if (code == 0) then
             ps%stat = PLASTIC_BAD_INPUT
             ps%msg  = "plastic_solve_smb: slide%law must be linear, weertman or coulomb"
+        else if (trim(c%method) /= "steady" .and. trim(c%method) /= "routing") then
+            ps%stat = PLASTIC_BAD_INPUT
+            ps%msg  = 'plastic_solve_smb: ctrl%method must be "steady" or "routing"'
+        else if (trim(c%lin) /= "auto" .and. trim(c%lin) /= "lis" .and. trim(c%lin) /= "builtin") then
+            ps%stat = PLASTIC_BAD_INPUT
+            ps%msg  = 'plastic_solve_smb: ctrl%lin must be "auto", "lis" or "builtin"'
+        else if (trim(c%lin) == "lis" .and. .not. lin_has_lis()) then
+            ps%stat = PLASTIC_BAD_INPUT
+            ps%msg  = 'plastic_solve_smb: ctrl%lin = "lis" but the library was built without lis=1'
         else if (trim(c%mode) /= "surface" .and. trim(c%mode) /= "flat") then
             ps%stat = PLASTIC_BAD_INPUT
             ps%msg  = "plastic_solve_smb: ctrl%mode must be ""surface"" or ""flat"""
@@ -211,7 +241,42 @@ contains
             end if
         end if
 
-        ! --- outer iteration: route, invert, sweep, relax --------------------------------
+        ! --- steady: direct solve of div q = smb, H >= 0 ------------------------------------
+        if (trim(c%method) == "steady") then
+            call steady_solve(ps, z_bed, z_sl, smb, mask, rheo, slide, c%res_tol, c%n_steady, c%dt0, &
+                              c%dt_max, c%lin_tol, c%lin_maxit, trim(c%lin) /= "builtin", it, &
+                              ps%outer_change, outer_ok, n_lin_fail, c%verbose)
+            ps%n_outer_used = it
+            ps%converged = outer_ok .and. inner_ok
+            if (.not. outer_ok) then
+                write(s, '(es9.2)') ps%outer_change
+                ps%msg = "plastic_solve_smb: steady residual "//trim(adjustl(s))//" m/yr above res_tol"
+            end if
+            call steady_tau(ps, mask, ps%wk%f2)
+            do j = 1, ny
+                do i = 1, nx
+                    if (mask(i, j)) then
+                        ps%z_srf(i, j) = ps%H(i, j) + z_bed(i, j)
+                        ps%w(i, j)     = ps%H(i, j) * ps%H(i, j)
+                    else
+                        ps%z_srf(i, j) = z_bed(i, j)
+                        ps%w(i, j)     = plastic_flotation_thickness(z_bed(i, j), z_sl(i, j), ps%par)**2
+                    end if
+                end do
+            end do
+            if (ps%converged) then
+                ps%stat = PLASTIC_OK
+            else
+                ps%stat = PLASTIC_NOT_CONVERGED
+            end if
+            if (present(tau_d)) tau_d = ps%wk%f2
+            ps%wk%mask_prev = mask
+            ps%has_warm = .true.
+            if (present(stat)) stat = ps%stat
+            return
+        end if
+
+        ! --- routing: route, invert, sweep, relax ----------------------------------------
         r = c%relax
         outer_ok = .false.
         do it = 1, c%n_outer
@@ -334,7 +399,9 @@ contains
         ! Thickness of an ice cell from the inner solution in ps%wk%wc.
         real(dp) function thick(i, j)
             integer, intent(in) :: i, j
-            if (surf) then
+            if (ps%wk%wc(i, j) >= BIG) then
+                thick = 0.0_dp                            ! not reached by the sweep
+            else if (surf) then
                 thick = max(ps%wk%wc(i, j) - z_bed(i, j), 0.0_dp)
             else
                 thick = sqrt(max(ps%wk%wc(i, j), 0.0_dp))

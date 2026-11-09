@@ -7,6 +7,7 @@ module plastic_solver
 
     use plastic_kinds,   only: dp, BIG, MSG_LEN
     use plastic_eikonal
+    use plastic_linsolve, only: plastic_lin_t
 
     implicit none
 
@@ -38,6 +39,13 @@ module plastic_solver
         real(dp), allocatable :: f1(:,:), f2(:,:)     ! scratch: flux, inflow / driving stress
         integer,  allocatable :: idx(:), ti(:)        ! balance-flux ordering (nx*ny)
         real(dp), allocatable :: key(:), tk(:)
+        ! steady SMB-driven solver (plastic_steady)
+        real(dp), allocatable :: sF(:,:), sFp(:,:), sS(:,:), sHk(:,:), sHt(:,:), sHm(:,:), sSm(:,:)
+        real(dp), allocatable :: qx(:,:), qy(:,:)     ! face fluxes (0:nx,ny), (nx,0:ny)
+        real(dp), allocatable :: jl(:,:,:)            ! dF_P/dH over the 3 x 3 block, (9,nx,ny)
+        integer,  allocatable :: sid(:,:)             ! unknown number of an ice cell (0: none)
+        logical,  allocatable :: sact(:,:)            ! active set (H = 0)
+        type(plastic_lin_t)   :: lin
     end type plastic_work_t
 
     type plastic_t
@@ -94,6 +102,9 @@ contains
         ps%wk%mask_prev = .false.
         allocate(ps%wk%ex(nx, ny), ps%wk%ey(nx, ny), ps%wk%f1(nx, ny), ps%wk%f2(nx, ny))
         allocate(ps%wk%idx(nx*ny), ps%wk%ti(nx*ny), ps%wk%key(nx*ny), ps%wk%tk(nx*ny))
+        allocate(ps%wk%sF(nx, ny), ps%wk%sFp(nx, ny), ps%wk%sS(nx, ny), ps%wk%sHk(nx, ny), &
+                 ps%wk%sHt(nx, ny), ps%wk%sHm(nx, ny), ps%wk%sSm(nx, ny), ps%wk%qx(0:nx, ny), &
+                 ps%wk%qy(nx, 0:ny), ps%wk%jl(9, nx, ny), ps%wk%sid(nx, ny), ps%wk%sact(nx, ny))
 
         ps%has_warm = .false.
         ps%stat = PLASTIC_OK
@@ -129,6 +140,10 @@ contains
         if (allocated(ps%wk%ti))        deallocate(ps%wk%ti)
         if (allocated(ps%wk%key))       deallocate(ps%wk%key)
         if (allocated(ps%wk%tk))        deallocate(ps%wk%tk)
+        if (allocated(ps%wk%sF)) deallocate(ps%wk%sF, ps%wk%sFp, ps%wk%sS, ps%wk%sHk, ps%wk%sHt, &
+                                            ps%wk%sHm, ps%wk%sSm, ps%wk%qx, ps%wk%qy, ps%wk%jl, &
+                                            ps%wk%sid, ps%wk%sact)
+        ps%wk%lin = plastic_lin_t()
         ps%nx = 0
         ps%ny = 0
         ps%has_warm = .false.

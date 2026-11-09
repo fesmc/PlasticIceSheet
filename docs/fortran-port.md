@@ -324,16 +324,20 @@ it (fixed point; exact up to the solver tolerance).
 
 Pseudo-transient continuation with a semismooth Newton step per pseudo-time step:
 
-    G(H) = (H - H_k)/dt_k + F(H),  Phi(H) = min(H, c G(H)) = 0,  c = 1 yr.
+    G(H) = (H - H_k)/dt_k + F(H),  Phi(H) = min(H, dt_k G(H)) = 0.
 
-- Active set A = {cells with H <= c G}: equation H = 0. Inactive cells: the Newton row
+- Active set A = {cells with H <= dt_k G} (an explicit pseudo-time step would empty the
+  cell; the set shrinks with dt, so a rejected step is retried with fewer active
+  cells): equation H = 0. Inactive cells: the Newton row
   of G, (1/dt) d_P + sum_K dF_P/dH_K d_K = -G_P, with d_K = -H_K for K in A moved to the
   right-hand side. New iterate H + d, then max(., 0) (projection).
 - Jacobian dF/dH by finite differences with 9 colours: F_P depends on H in the 3 x 3
   block around P, so perturbing every third cell in x and y at once gives one column
   per cell per residual evaluation (10 residual evaluations per Newton step; works for all
   three sliding laws).
-- dt: switched evolution relaxation, dt_{k+1} = dt_k ||F_k||/||F_{k+1}||, within
+- dt: switched evolution relaxation, dt_{k+1} = dt_k ||F_k||/||F_{k+1}|| (at least 1.5 dt_k
+  after a step that did not increase the residual, so that a slowly decaying residual
+  cannot stall dt), within
   [ctrl%dt0, ctrl%dt_max]; a step that increases the residual ten-fold is rejected and dt
   halved. The pseudo-time term keeps the system well posed at divides (where dF/dH
   vanishes with |grad s|) and at the start.

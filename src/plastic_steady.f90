@@ -1,0 +1,457 @@
+! Steady SMB-driven reconstruction, direct formulation (docs/fortran-port.md, "direct
+! steady formulation"): steady mass conservation div q = smb on the mask with the
+! membrane-free DIVA flux q = -H U(tau, H) grad s/|grad s|, tau = rho_i g H |grad s|, and
+! the obstacle H >= 0, solved by pseudo-transient continuation with one semismooth
+! (active-set) Newton step per pseudo-time step; a cell is active (H = 0) when an
+! explicit pseudo-time step would empty it, H <= dt F.
+!
+! Finite volumes with staggered face fluxes: Mahaffy faces between ice cells, and a
+! one-sided face flux from an ice cell to the margin (at the margin position of the
+! plastic solve, margin_frac). The implied SMB of a geometry, plastic_smb_flux_divergence,
+! is the divergence of the same face fluxes, so a geometry forced by its own implied SMB
+! is a root of the residual.
+module plastic_steady
+
+    use plastic_kinds,    only: dp
+    use plastic_eikonal,  only: plastic_flotation_thickness
+    use plastic_solver,   only: plastic_t, check_shape, margin_spacing, &
+                                PLASTIC_OK, PLASTIC_NOT_CONVERGED, PLASTIC_BAD_INPUT
+    use plastic_flow,     only: plastic_glen_t, plastic_sliding_t, LAW_COULOMB, &
+                                sliding_law_code, basal_velocity_code, deformational_velocity
+    use plastic_linsolve, only: lin_reserve, lin_solve, lin_has_lis
+
+    implicit none
+
+    private
+    public :: steady_solve, plastic_smb_flux_divergence, steady_margin_values, steady_tau
+
+contains
+
+    ! --- flux law ---------------------------------------------------------------------
+
+    ! Normal flux -Hf U(tau, Hf) gn/|g| through a face, g = (gn, gt) the surface slope.
+    pure function face_q(Hf, gn, gt, rg, taucap, code, slide, rheo) result(q)
+        real(dp),                intent(in) :: Hf, gn, gt, rg, taucap
+        integer,                 intent(in) :: code
+        type(plastic_sliding_t), intent(in) :: slide
+        type(plastic_glen_t),    intent(in) :: rheo
+        real(dp) :: q, g, tau, u
+        q = 0.0_dp
+        g = sqrt(gn * gn + gt * gt)
+        if (.not. (Hf > 0.0_dp .and. g > 0.0_dp)) return
+        tau = min(rg * Hf * g, taucap)
+        u = basal_velocity_code(code, slide, tau) + deformational_velocity(rheo, tau, Hf)
+        q = -Hf * u * gn / g
+    end function face_q
+
+    ! Outflow from ice cell P to the margin at distance dc (one-sided slope, segment-mean
+    ! thickness with the margin thickness hmM), never inflow.
+    pure function margin_q(HP, hmM, sP, sM, dc, gt, rg, taucap, code, slide, rheo) result(q)
+        real(dp),                intent(in) :: HP, hmM, sP, sM, dc, gt, rg, taucap
+        integer,                 intent(in) :: code
+        type(plastic_sliding_t), intent(in) :: slide
+        type(plastic_glen_t),    intent(in) :: rheo
+        real(dp) :: q
+        q = max(face_q(0.5_dp * (HP + hmM), (sM - sP) / dc, gt, rg, taucap, code, slide, rheo), 0.0_dp)
+    end function margin_q
+
+    ! Central slope of s at (i,j) along y (dir = 2) or x (dir = 1), clamp-to-edge.
+    pure function cslope(nx, ny, s, i, j, d, dir) result(g)
+        integer,  intent(in) :: nx, ny, i, j, dir
+        real(dp), intent(in) :: s(nx, ny), d
+        real(dp) :: g
+        integer  :: a, b
+        g = 0.0_dp
+        if (dir == 1) then
+            a = max(i - 1, 1); b = min(i + 1, nx)
+            if (b > a) g = (s(b, j) - s(a, j)) / (real(b - a, dp) * d)
+        else
+            a = max(j - 1, 1); b = min(j + 1, ny)
+            if (b > a) g = (s(i, b) - s(i, a)) / (real(b - a, dp) * d)
+        end if
+    end function cslope
+
+    ! Residual F = div q - smb on the ice cells (0 elsewhere); s, qx, qy are outputs.
+    subroutine steady_residual(nx, ny, H, zb, sm, hm, mask, dfac, smb, dx, dy, rg, taucap, &
+                               code, slide, rheo, s, qx, qy, F)
+        integer,                 intent(in)  :: nx, ny, code
+        real(dp),                intent(in)  :: H(nx, ny), zb(nx, ny), sm(nx, ny), hm(nx, ny)
+        real(dp),                intent(in)  :: dfac(nx, ny), smb(nx, ny), dx, dy, rg, taucap
+        logical,                 intent(in)  :: mask(nx, ny)
+        type(plastic_sliding_t), intent(in)  :: slide
+        type(plastic_glen_t),    intent(in)  :: rheo
+        real(dp),                intent(out) :: s(nx, ny), qx(0:nx, ny), qy(nx, 0:ny), F(nx, ny)
+        integer  :: i, j
+
+        !$omp parallel private(i, j)
+        !$omp do schedule(static)
+        do j = 1, ny
+            do i = 1, nx
+                if (mask(i, j)) then
+                    s(i, j) = zb(i, j) + H(i, j)
+                else
+                    s(i, j) = sm(i, j)
+                end if
+            end do
+        end do
+        !$omp end do
+        !$omp do schedule(static)
+        do j = 1, ny
+            qx(0, j) = 0.0_dp
+            qx(nx, j) = 0.0_dp
+            do i = 1, nx - 1
+                if (mask(i, j) .and. mask(i + 1, j)) then
+                    qx(i, j) = face_q(0.5_dp * (H(i, j) + H(i + 1, j)), (s(i + 1, j) - s(i, j)) / dx, &
+                                      0.5_dp * (cslope(nx, ny, s, i, j, dy, 2) + cslope(nx, ny, s, i + 1, j, dy, 2)), &
+                                      rg, taucap, code, slide, rheo)
+                else if (mask(i, j)) then
+                    qx(i, j) = margin_q(H(i, j), hm(i + 1, j), s(i, j), s(i + 1, j), dfac(i + 1, j) * dx, &
+                                        cslope(nx, ny, s, i, j, dy, 2), rg, taucap, code, slide, rheo)
+                else if (mask(i + 1, j)) then
+                    qx(i, j) = -margin_q(H(i + 1, j), hm(i, j), s(i + 1, j), s(i, j), dfac(i, j) * dx, &
+                                         cslope(nx, ny, s, i + 1, j, dy, 2), rg, taucap, code, slide, rheo)
+                else
+                    qx(i, j) = 0.0_dp
+                end if
+            end do
+        end do
+        !$omp end do nowait
+        !$omp do schedule(static)
+        do j = 0, ny
+            do i = 1, nx
+                if (j == 0 .or. j == ny) then
+                    qy(i, j) = 0.0_dp
+                else if (mask(i, j) .and. mask(i, j + 1)) then
+                    qy(i, j) = face_q(0.5_dp * (H(i, j) + H(i, j + 1)), (s(i, j + 1) - s(i, j)) / dy, &
+                                      0.5_dp * (cslope(nx, ny, s, i, j, dx, 1) + cslope(nx, ny, s, i, j + 1, dx, 1)), &
+                                      rg, taucap, code, slide, rheo)
+                else if (mask(i, j)) then
+                    qy(i, j) = margin_q(H(i, j), hm(i, j + 1), s(i, j), s(i, j + 1), dfac(i, j + 1) * dy, &
+                                        cslope(nx, ny, s, i, j, dx, 1), rg, taucap, code, slide, rheo)
+                else if (mask(i, j + 1)) then
+                    qy(i, j) = -margin_q(H(i, j + 1), hm(i, j), s(i, j + 1), s(i, j), dfac(i, j) * dy, &
+                                         cslope(nx, ny, s, i, j + 1, dx, 1), rg, taucap, code, slide, rheo)
+                else
+                    qy(i, j) = 0.0_dp
+                end if
+            end do
+        end do
+        !$omp end do
+        !$omp do schedule(static)
+        do j = 1, ny
+            do i = 1, nx
+                if (mask(i, j)) then
+                    F(i, j) = (qx(i, j) - qx(i - 1, j)) / dx + (qy(i, j) - qy(i, j - 1)) / dy - smb(i, j)
+                else
+                    F(i, j) = 0.0_dp
+                end if
+            end do
+        end do
+        !$omp end do
+        !$omp end parallel
+    end subroutine steady_residual
+
+    ! Complementarity residual max |min(H, F)|: |F| on cells with ice, max(-F, 0) at H = 0.
+    function ncp_norm(nx, ny, H, F, mask) result(r)
+        integer,  intent(in) :: nx, ny
+        real(dp), intent(in) :: H(nx, ny), F(nx, ny)
+        logical,  intent(in) :: mask(nx, ny)
+        real(dp) :: r
+        integer  :: i, j
+        r = 0.0_dp
+        !$omp parallel do private(i, j) reduction(max:r) schedule(static)
+        do j = 1, ny
+            do i = 1, nx
+                if (.not. mask(i, j)) cycle
+                if (H(i, j) > 0.0_dp) then
+                    r = max(r, abs(F(i, j)))
+                else
+                    r = max(r, -F(i, j))
+                end if
+            end do
+        end do
+        !$omp end parallel do
+    end function ncp_norm
+
+    ! Margin surface sm = z_b + H_flt and margin thickness hm = H_flt on all cells.
+    subroutine steady_margin_values(ps, z_bed, z_sl, sm, hm)
+        type(plastic_t), intent(in)  :: ps
+        real(dp),        intent(in)  :: z_bed(:,:), z_sl(:,:)
+        real(dp),        intent(out) :: sm(:,:), hm(:,:)
+        integer :: i, j
+        do j = 1, ps%ny
+            do i = 1, ps%nx
+                hm(i, j) = plastic_flotation_thickness(z_bed(i, j), z_sl(i, j), ps%par)
+                sm(i, j) = z_bed(i, j) + hm(i, j)
+            end do
+        end do
+    end subroutine steady_margin_values
+
+    ! Driving stress rho_i g H |grad s| at the cell centres (central slopes).
+    subroutine steady_tau(ps, mask, tau)
+        type(plastic_t), intent(in)  :: ps
+        logical,         intent(in)  :: mask(:,:)
+        real(dp),        intent(out) :: tau(:,:)
+        integer  :: i, j
+        real(dp) :: rg
+        rg = ps%par%rho_i * ps%par%g
+        do j = 1, ps%ny
+            do i = 1, ps%nx
+                tau(i, j) = 0.0_dp
+                if (mask(i, j)) tau(i, j) = rg * ps%H(i, j) * &
+                    hypot(cslope(ps%nx, ps%ny, ps%wk%sS, i, j, ps%dx, 1), cslope(ps%nx, ps%ny, ps%wk%sS, i, j, ps%dy, 2))
+            end do
+        end do
+    end subroutine steady_tau
+
+    ! Implied SMB of the geometry on ps (ps%H): the divergence of the steady solver's face
+    ! fluxes [m ice / yr] (closure B of ctrl%method = "steady"). The margin position is
+    ! margin_frac or par%margin, as in plastic_solve.
+    subroutine plastic_smb_flux_divergence(ps, z_bed, z_sl, mask, rheo, slide, smb, margin_frac, stat)
+        type(plastic_t),         intent(inout) :: ps
+        real(dp),                intent(in)    :: z_bed(:,:), z_sl(:,:)
+        logical,                 intent(in)    :: mask(:,:)
+        type(plastic_glen_t),    intent(in)    :: rheo
+        type(plastic_sliding_t), intent(in)    :: slide
+        real(dp),                intent(out)   :: smb(:,:)
+        real(dp), optional,      intent(in)    :: margin_frac(:,:)
+        integer,  optional,      intent(out)   :: stat
+        integer  :: code
+        real(dp) :: taucap
+
+        ps%stat = PLASTIC_OK
+        ps%msg  = ""
+        code = sliding_law_code(slide)
+        if (.not. allocated(ps%H) .or. code == 0) then
+            ps%stat = PLASTIC_BAD_INPUT
+            ps%msg  = "plastic_smb_flux_divergence: not initialized or unknown sliding law"
+        else
+            call check_shape(ps, size(z_bed, 1), size(z_bed, 2), "z_bed")
+            call check_shape(ps, size(z_sl, 1),  size(z_sl, 2),  "z_sl")
+            call check_shape(ps, size(mask, 1),  size(mask, 2),  "mask")
+            call check_shape(ps, size(smb, 1),   size(smb, 2),   "smb")
+            call margin_spacing(ps, mask, margin_frac)
+        end if
+        if (present(stat)) stat = ps%stat
+        if (ps%stat /= PLASTIC_OK) return
+
+        taucap = huge(1.0_dp)
+        if (code == LAW_COULOMB) taucap = 0.999_dp * slide%C
+        call steady_margin_values(ps, z_bed, z_sl, ps%wk%sSm, ps%wk%sHm)
+        ps%wk%sFp = 0.0_dp
+        call steady_residual(ps%nx, ps%ny, ps%H, z_bed, ps%wk%sSm, ps%wk%sHm, mask, ps%wk%dfac, ps%wk%sFp, &
+                             ps%dx, ps%dy, ps%par%rho_i * ps%par%g, taucap, code, slide, rheo, &
+                             ps%wk%sS, ps%wk%qx, ps%wk%qy, ps%wk%sF)
+        smb = ps%wk%sF
+    end subroutine plastic_smb_flux_divergence
+
+    ! Steady solve from the initial thickness in ps%H (ps%wk%dfac set by the caller).
+    ! Returns the number of pseudo-time steps, the final complementarity residual [m/yr]
+    ! and whether it is below res_tol; lin_fail counts linear solves that missed lin_tol.
+    subroutine steady_solve(ps, z_bed, z_sl, smb, mask, rheo, slide, res_tol, max_steps, dt0, dt_max, &
+                            lin_tol, lin_maxit, use_lis, n_steps, res, ok, lin_fail, verbose)
+        type(plastic_t),         intent(inout) :: ps
+        real(dp),                intent(in)    :: z_bed(:,:), z_sl(:,:), smb(:,:)
+        logical,                 intent(in)    :: mask(:,:)
+        type(plastic_glen_t),    intent(in)    :: rheo
+        type(plastic_sliding_t), intent(in)    :: slide
+        real(dp),                intent(in)    :: res_tol, dt0, dt_max, lin_tol
+        integer,                 intent(in)    :: max_steps, lin_maxit
+        logical,                 intent(in)    :: use_lis
+        integer,                 intent(out)   :: n_steps, lin_fail
+        real(dp),                intent(out)   :: res
+        logical,                 intent(out)   :: ok
+        logical,                 intent(in)    :: verbose
+
+        integer  :: nx, ny, code, k, i, j, a, b, c, ci, cj, n, nz, slot, ii, jj, row, kk, loc(2)
+        real(dp) :: rg, taucap, dt, res_new, dx, dy, d
+        logical  :: lok
+
+        nx = ps%nx; ny = ps%ny; dx = ps%dx; dy = ps%dy
+        code = sliding_law_code(slide)
+        rg = ps%par%rho_i * ps%par%g
+        taucap = huge(1.0_dp)
+        if (code == LAW_COULOMB) taucap = 0.999_dp * slide%C
+        call steady_margin_values(ps, z_bed, z_sl, ps%wk%sSm, ps%wk%sHm)
+        call lin_reserve(ps%wk%lin, count(mask), 9 * count(mask))
+
+        where (.not. mask) ps%H = 0.0_dp
+        ps%H = max(ps%H, 0.0_dp)
+        call resid(ps%H, ps%wk%sF)
+        res = ncp_norm(nx, ny, ps%H, ps%wk%sF, mask)
+        dt = dt0
+        n_steps = 0
+        lin_fail = 0
+        ok = res < res_tol
+
+        do k = 1, max_steps
+            if (ok) exit
+            n_steps = k
+
+            ! active set: H <= dt G (G = F at the start of the step): an explicit pseudo-time
+            ! step would empty the cell
+            !$omp parallel do private(i, j) schedule(static)
+            do j = 1, ny
+                do i = 1, nx
+                    ps%wk%sact(i, j) = mask(i, j) .and. ps%H(i, j) <= dt * ps%wk%sF(i, j)
+                end do
+            end do
+            !$omp end parallel do
+
+            ! Jacobian dF_P/dH_K over the 3 x 3 block by 9 coloured residual evaluations
+            ps%wk%jl = 0.0_dp
+            do c = 0, 8
+                ci = mod(c, 3); cj = c / 3
+                !$omp parallel do private(i, j) schedule(static)
+                do j = 1, ny
+                    do i = 1, nx
+                        ps%wk%sHt(i, j) = ps%H(i, j)
+                        if (mask(i, j) .and. mod(i, 3) == ci .and. mod(j, 3) == cj) &
+                            ps%wk%sHt(i, j) = ps%H(i, j) + 1.0e-7_dp * max(ps%H(i, j), 10.0_dp)
+                    end do
+                end do
+                !$omp end parallel do
+                call resid(ps%wk%sHt, ps%wk%sFp)
+                !$omp parallel do private(i, j, a, b, ii, jj, d) schedule(static)
+                do j = 1, ny
+                    do i = 1, nx
+                        if (.not. mask(i, j)) cycle
+                        do b = -1, 1
+                            jj = j + b
+                            if (jj < 1 .or. jj > ny) cycle
+                            if (mod(jj, 3) /= cj) cycle
+                            do a = -1, 1
+                                ii = i + a
+                                if (ii < 1 .or. ii > nx) cycle
+                                if (mod(ii, 3) /= ci .or. .not. mask(ii, jj)) cycle
+                                d = ps%wk%sHt(ii, jj) - ps%H(ii, jj)
+                                ps%wk%jl((b + 1) * 3 + a + 2, i, j) = (ps%wk%sFp(i, j) - ps%wk%sF(i, j)) / d
+                            end do
+                        end do
+                    end do
+                end do
+                !$omp end parallel do
+            end do
+
+            ! unknowns: inactive ice cells, column-major
+            n = 0
+            do j = 1, ny
+                do i = 1, nx
+                    ps%wk%sid(i, j) = 0
+                    if (mask(i, j) .and. .not. ps%wk%sact(i, j)) then
+                        n = n + 1
+                        ps%wk%sid(i, j) = n
+                    end if
+                end do
+            end do
+
+            if (n > 0) then
+                ! row pointers
+                ps%wk%lin%ia(1) = 1
+                do j = 1, ny
+                    do i = 1, nx
+                        row = ps%wk%sid(i, j)
+                        if (row == 0) cycle
+                        nz = 0
+                        do b = -1, 1
+                            do a = -1, 1
+                                ii = i + a; jj = j + b
+                                if (ii < 1 .or. ii > nx .or. jj < 1 .or. jj > ny) cycle
+                                if (ps%wk%sid(ii, jj) > 0) nz = nz + 1
+                            end do
+                        end do
+                        ps%wk%lin%ia(row + 1) = ps%wk%lin%ia(row) + nz
+                    end do
+                end do
+                ps%wk%lin%n = n
+                ps%wk%lin%nnz = ps%wk%lin%ia(n + 1) - 1
+                ! entries and right-hand side (rows in parallel)
+                !$omp parallel do private(i, j, a, b, ii, jj, row, kk, slot) schedule(static)
+                do j = 1, ny
+                    do i = 1, nx
+                        row = ps%wk%sid(i, j)
+                        if (row == 0) cycle
+                        kk = ps%wk%lin%ia(row)
+                        ps%wk%lin%b(row) = -ps%wk%sF(i, j)
+                        do b = -1, 1
+                            do a = -1, 1
+                                ii = i + a; jj = j + b
+                                if (ii < 1 .or. ii > nx .or. jj < 1 .or. jj > ny) cycle
+                                if (.not. mask(ii, jj)) cycle
+                                slot = (b + 1) * 3 + a + 2
+                                if (ps%wk%sid(ii, jj) > 0) then
+                                    ps%wk%lin%ja(kk) = ps%wk%sid(ii, jj)
+                                    ps%wk%lin%a(kk)  = ps%wk%jl(slot, i, j)
+                                    if (a == 0 .and. b == 0) ps%wk%lin%a(kk) = ps%wk%lin%a(kk) + 1.0_dp / dt
+                                    kk = kk + 1
+                                else
+                                    ! active neighbour: d_K = -H_K on the right-hand side
+                                    ps%wk%lin%b(row) = ps%wk%lin%b(row) + ps%wk%jl(slot, i, j) * ps%H(ii, jj)
+                                end if
+                            end do
+                        end do
+                        ps%wk%lin%x(row) = 0.0_dp
+                    end do
+                end do
+                !$omp end parallel do
+                call lin_solve(ps%wk%lin, lin_tol, lin_maxit, use_lis .and. lin_has_lis(), lok)
+                if (.not. lok) lin_fail = lin_fail + 1
+            end if
+
+            ! trial: H + d projected on H >= 0 (active cells to 0)
+            !$omp parallel do private(i, j) schedule(static)
+            do j = 1, ny
+                do i = 1, nx
+                    if (.not. mask(i, j)) then
+                        ps%wk%sHt(i, j) = 0.0_dp
+                    else if (ps%wk%sact(i, j)) then
+                        ps%wk%sHt(i, j) = 0.0_dp
+                    else
+                        ps%wk%sHt(i, j) = max(ps%H(i, j) + ps%wk%lin%x(ps%wk%sid(i, j)), 0.0_dp)
+                    end if
+                end do
+            end do
+            !$omp end parallel do
+            call resid(ps%wk%sHt, ps%wk%sFp)
+            res_new = ncp_norm(nx, ny, ps%wk%sHt, ps%wk%sFp, mask)
+
+            if (verbose) write(*, '(a,i5,a,es9.2,a,es9.2,a,es9.2,a,i7,a,i7,a,i4,a,es9.2)') "  steady ", k, &
+                ": dt ", dt, " res ", res, " -> ", res_new, ", unknowns ", n, ", active ", &
+                count(ps%wk%sact), ", lin it ", ps%wk%lin%iters, " relres ", ps%wk%lin%relres
+            if (verbose) then
+                loc = maxloc(merge(abs(ps%wk%sFp), 0.0_dp, mask .and. ps%wk%sHt > 0.0_dp))
+                write(*, '(a,2i5,a,f10.2,a,es10.3)') "         max |F| at ", loc, " H ", ps%wk%sHt(loc(1), loc(2)), &
+                    " F ", ps%wk%sFp(loc(1), loc(2))
+            end if
+            if (res_new > 10.0_dp * res .or. res_new /= res_new) then
+                dt = 0.5_dp * dt                     ! reject: shorter pseudo-time step
+                if (dt < 1.0e-12_dp * dt0) exit
+                cycle
+            end if
+            ps%H  = ps%wk%sHt
+            ps%wk%sF = ps%wk%sFp
+            ! SER, growing at least 1.5x after a step that did not increase the residual
+            if (res_new <= res) then
+                dt = min(dt * max(res / max(res_new, tiny(1.0_dp)), 1.5_dp), dt_max)
+            else
+                dt = dt * res / res_new
+            end if
+            dt = max(dt, dt0 * 1.0e-6_dp)
+            res = res_new
+            ok = res < res_tol
+        end do
+        ! leave s, qx, qy of the final state in the workspace
+        call resid(ps%H, ps%wk%sF)
+
+    contains
+
+        subroutine resid(Hx, Fx)
+            real(dp), intent(in)  :: Hx(:,:)
+            real(dp), intent(out) :: Fx(:,:)
+            call steady_residual(nx, ny, Hx, z_bed, ps%wk%sSm, ps%wk%sHm, mask, ps%wk%dfac, smb, dx, dy, &
+                                 rg, taucap, code, slide, rheo, ps%wk%sS, ps%wk%qx, ps%wk%qy, Fx)
+        end subroutine resid
+
+    end subroutine steady_solve
+
+end module plastic_steady

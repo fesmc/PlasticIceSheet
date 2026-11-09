@@ -15,6 +15,23 @@ ifeq ($(pic), 1)
     FFLAGS := $(FFLAGS) -fPIC
 endif
 
+# Lis (make lis=1): BiCGStab + ILU(0) of the steady SMB-driven solver through Lis
+# instead of the built-in solver. LISROOT (fragment or command line) is the Lis
+# install matching openmp= (fesm-utils' lis-omp / lis-serial, ifx-built).
+DEFS_LIS =
+INC_LIS  =
+LIB_LIS  =
+ifeq ($(lis), 1)
+    ifeq ($(openmp), 1)
+        LISROOT ?= $(LISROOT_OMP)
+    else
+        LISROOT ?= $(LISROOT_SERIAL)
+    endif
+    DEFS_LIS = -DPLASTIC_LIS
+    INC_LIS  = -I$(LISROOT)/include
+    LIB_LIS  = -L$(LISROOT)/lib -llis
+endif
+
 LFLAGS_EXTRA ?=
 LFLAGS = $(LFLAGS_EXTRA)
 

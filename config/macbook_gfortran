@@ -3,6 +3,7 @@
 FC = gfortran
 
 FFLAGS = -ffree-line-length-none -I$(objdir) -J$(objdir)
+CPPFLAGS_PP = -cpp
 FFLAGS_OPENMP = -fopenmp
 
 DFLAGS_NODEBUG = -O3 -mcpu=native

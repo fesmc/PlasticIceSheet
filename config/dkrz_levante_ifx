@@ -4,6 +4,7 @@
 FC = ifx
 
 FFLAGS = -no-wrap-margin -module $(objdir) -I$(objdir)
+CPPFLAGS_PP = -fpp
 FFLAGS_OPENMP = -qopenmp
 
 # -fp-model precise: the library tests NaN (RegularizedCoulomb at its cap) and must
@@ -11,6 +12,10 @@ FFLAGS_OPENMP = -qopenmp
 DFLAGS_NODEBUG = -O3 -march=core-avx2 -fp-model precise -traceback
 DFLAGS_DEBUG   = -C -O0 -g -traceback -ftrapuv -fpe0 -check all,nouninit -fp-model precise -debug extended -warn interfaces
 DFLAGS_PROFILE = -O2 -fp-model precise -pg
+
+# Lis (make lis=1): fesm-utils' ifx-built Lis.
+LISROOT_OMP    ?= /work/ba1442/robinson/models/fesm-utils/lis/lis-omp
+LISROOT_SERIAL ?= /work/ba1442/robinson/models/fesm-utils/lis/lis-serial
 
 # Only for the comparison driver (make compare): fesm-utils ncio + netCDF.
 FESMUTILSROOT ?= /work/ba1442/robinson/models/fesm-utils
