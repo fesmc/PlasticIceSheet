@@ -32,7 +32,8 @@ V = plastic_volume(ps); A = plastic_area(ps, mask); m = plastic_surface_misfit(p
 ! closures
 type(plastic_glen_t)     :: rheo   ! A=1e-16 [Pa^-n yr^-1], n=3
 type(plastic_sliding_t)  :: slide  ! law="linear"|"weertman"|"coulomb", beta, m, C, u_0
-type(plastic_smb_ctrl_t) :: ctrl   ! n_outer=1000, relax=0.05, tol=1.0, tau_hi=5e5,
+type(plastic_smb_ctrl_t) :: ctrl   ! mode="surface"|"flat" (inner solve; "flat" = Julia),
+                                   ! n_outer=1000, relax=0.05, tol=1.0, tau_hi=5e5,
                                    ! max_sweeps=400, sweep_tol=1e-9, tau_init=5e4
 call plastic_velocity(ps, tau_b, mask, rheo, slide, ux, uy [, speed, slope_eps, u_b, u_def, stat])
 call plastic_smb_implied(ps, ux, uy, mask, smb [, speed, stat])
@@ -137,6 +138,67 @@ The residual of `plastic_stress_residual` is cell-centred (H of the cell): it is
 surface lies below the cell's bed, and O(dx) elsewhere. Its scheme-consistent
 counterpart is `plastic_residual` (the Godunov residual of z_s), < 1e-8 m.
 
+## SMB-driven reconstruction: why it does not converge
+
+`plastic_solve_smb` (Julia `diva_reconstruct`) iterates H -> T(H): route the SMB down
+z_s = z_b + H with the MFD weights (flux Q), invert the DIVA flux law per cell for tau_d,
+solve the plastic equation with tau_d (inner mode `ctrl%mode`, `"surface"` by default,
+`"flat"` as Julia), and under-relax, H <- H + r (T(H) - H). The `"surface"` inner solve
+does not make it converge. `compare/smb_diag.f90`, 2000 iterations at r = 0.05 from the
+cold start:
+
+| case (forcing) | inner | final max abs(T(H) - H) [m] | rate (2nd half) | time per iteration |
+|---|---|---|---|---|
+| synth150 (closure-B SMB of the flat solution) | surface | 351 | 0.9996 | 21 ms |
+| synth150 | flat | 624 | 0.9999 | 19 ms |
+| grl32 (MAR v3.14, Coulomb) | surface | 305 | 0.999 | 4.2 ms |
+| grl32 | flat | 757 | 0.9996 | 3.9 ms |
+| nh32_0ka (implied SMB; no SMB product on NH-32KM) | surface | 1719 | 1.0001 | 8.2 ms |
+
+With the implied SMB of the plastic solution (`forcing implied`) H0 is an exact fixed
+point (T(H0) - H0 < 4e-11 m), yet the iteration from the cold start ends 370-900 m rms
+away from it. Its linear stability, from power iteration on the finite-difference
+Jacobian J of T at H0:
+
+| case | inner | dominant eigenvalue of J | eigenvector | stable for r < 2/(1 - lambda) |
+|---|---|---|---|---|
+| grl32 | surface | -188 | interior | 0.011 |
+| grl32 | flat | -51 | interior | 0.038 |
+| synth150 | surface | -596 | interior | 0.0034 |
+| synth150 | flat | -234 | interior | 0.0085 |
+
+The bound is exact: on grl32/flat a 1 m perturbation of H0 decays at r = 0.02 (6.5e-5 m
+after 400 iterations) and grows to ~100 m at r = 0.05.
+
+Cause: the MFD weights split a cell's flux by the surface drops to its neighbours, which
+are slope x dx (a few metres). A change dH of the surface moves the split by O(dH / (slope
+dx)), Q by the same fraction, tau_d ~ Q^(1/3)..., and the swept thickness downstream in the
+opposite direction: |lambda| ~ H / (slope dx), large and growing with resolution. The
+map is also discontinuous: routing changes (sort order, drops through zero) and cells
+with Q <= 0 (tau_d = 0, the surface goes flat) carry the largest moves (`smb_diag`
+classes). Under-relaxation would have to scale like slope dx / H, case by case, and still
+fails from a far start. This is structural, not a tuning problem.
+
+Structural fix (not implemented in the library; prototype `compare/smb_sia_proto.f90`):
+solve mass conservation directly, div q = smb on the mask with the same membrane-free
+DIVA flux, q = -H (u_b(tau) + u_def(tau, H)) grad z_s/|grad z_s|, tau = rho_i g H |grad z_s|.
+This is the steady SIA with sliding, a monotone degenerate-elliptic problem (obstacle
+H >= 0) with a unique solution; the flux depends on the local slope continuously, not on
+a routing partition. The prototype uses explicit pseudo-time steps (staggered Mahaffy
+fluxes, dt = 0.2 dx^2 / max D, ice-free cells fixed at z_b + H_flt):
+
+| case (forcing) | result |
+|---|---|
+| grl32 (MAR) | steady: max abs(dH/dt) 1e-9 m/yr after 20552 steps (46 kyr), 6.4 s; 21 mask cells end ice-free |
+| grl32, nh32_0ka (implied) | interior steady; margin cells cycle on the H = 0 obstacle (max abs(dH/dt) 24, 229 m/yr): the MFD-implied SMB puts all terminal flux into the margin cells as ablation, while the SIA flux leaves through the margin faces, so this forcing is inconsistent with it |
+| synth150 (dx = 2 km, implied) | dt = 2e-3 yr: 1e6 steps (~30 min) reach only ~2 kyr, rms 35 m from the plastic solution (explicit stepping too slow at km resolution); same margin cycling |
+
+For the library this needs decisions: an implicit (Picard/Newton) solver with a
+dependency-free linear solver for km-scale grids, the margin/outflow treatment (and a
+matching implied-SMB operator, replacing the MFD closures, so the plastic solution stays
+a fixed point), and how the result relates to the plastic modes (tau_d = rho_i g H
+abs(grad z_s) becomes an output).
+
 ## Build
 
 ```bash
@@ -184,7 +246,8 @@ the SMB-driven solve.
 - `grl32`: Greenland GRL-32KM (FesmData: BedMachine v5 bed and grounded mask, MAR v3.14
   1961-1990 SMB), uniform tau_b = 1e5 Pa; full with relax = 0.4, n_outer = 500;
   SMB-driven with a regularized-Coulomb bed, C = rho_i g mean(H_obs), as
-  `examples/reconstruct_greenland.jl`. Sea level 0.
+  `examples/reconstruct_greenland.jl`. Sea level 0. The Fortran SMB-driven runs use
+  `ctrl%mode = "flat"` (Julia's inner solve).
 
 | case | field | max H [m] | max abs dH [m] | rms dH [m] | t Julia [s] | t Fortran [s] | Julia / Fortran |
 |---|---|---|---|---|---|---|---|
