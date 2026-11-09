@@ -108,6 +108,10 @@ check: test
 compare: $(objdir)/libplastic.a
 	$(FC) $(DFLAGS) $(FFLAGS) $(INC_FESMUTILS) -o $(bindir)/plastic_compare.x compare/plastic_compare.f90 \
 		-L$(objdir) -lplastic $(LIB_FESMUTILS) $(LIB_NC) $(LFLAGS)
+	$(FC) $(DFLAGS) $(FFLAGS) $(INC_FESMUTILS) -o $(bindir)/smb_diag.x compare/smb_diag.f90 \
+		-L$(objdir) -lplastic $(LIB_FESMUTILS) $(LIB_NC) $(LFLAGS)
+	$(FC) $(DFLAGS) $(FFLAGS) $(INC_FESMUTILS) -o $(bindir)/smb_sia_proto.x compare/smb_sia_proto.f90 \
+		-L$(objdir) -lplastic $(LIB_FESMUTILS) $(LIB_NC) $(LFLAGS)
 
 clean:
 	rm -f $(objdir)/*.o $(objdir)/*.mod $(objdir)/*.a $(objdir)/*.smod $(bindir)/*.x
