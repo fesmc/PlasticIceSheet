@@ -15,7 +15,7 @@ for kryos (see [Mode "surface"](#mode-surface)).
 ```fortran
 type(plastic_par_t)  :: par   ! rho_i=917, rho_w=1025, g=9.80665, H_min=1, mode="full"|"flat"|"surface",
                               ! max_sweeps=200, n_outer=100, tol=1e-6, outer_tol=1e-3, relax=0.5,
-                              ! warm_frac_max=0.1, margin="face"|"centre"
+                              ! warm_frac_max=0.1, margin="face"|"centre", sweep="serial"|"wavefront"
 type(plastic_t)      :: ps    ! par, nx, ny, dx, dy, w=H^2, H, z_srf, n_outer_used, converged,
                               ! stat, msg, n_sweeps, outer_change, warm_used, n_new_cells
 
@@ -32,9 +32,12 @@ V = plastic_volume(ps); A = plastic_area(ps, mask); m = plastic_surface_misfit(p
 ! closures
 type(plastic_glen_t)     :: rheo   ! A=1e-16 [Pa^-n yr^-1], n=3
 type(plastic_sliding_t)  :: slide  ! law="linear"|"weertman"|"coulomb", beta, m, C, u_0
-type(plastic_smb_ctrl_t) :: ctrl   ! mode="surface"|"flat" (inner solve; "flat" = Julia),
-                                   ! n_outer=1000, relax=0.05, tol=1.0, tau_hi=5e5,
-                                   ! max_sweeps=400, sweep_tol=1e-9, tau_init=5e4
+type(plastic_smb_ctrl_t) :: ctrl   ! method="steady"|"routing";
+                                   ! steady: res_tol=1e-6 [m/yr], n_steady=500, dt0=1, dt_max=1e8 [yr],
+                                   !   lin="auto"|"lis"|"builtin", lin_tol=1e-8, lin_maxit=2000, verbose;
+                                   ! routing: mode="surface"|"flat" (inner solve; "flat" = Julia),
+                                   !   n_outer=1000, relax=0.05, tol=1.0, tau_hi=5e5, max_sweeps=400,
+                                   !   sweep_tol=1e-9; both: tau_init=5e4 (cold start)
 call plastic_velocity(ps, tau_b, mask, rheo, slide, ux, uy [, speed, slope_eps, u_b, u_def, stat])
 call plastic_smb_implied(ps, ux, uy, mask, smb [, speed, stat])
 call plastic_balance_flux(z_srf, mask, smb, dx, dy, Q [, stat])
@@ -43,6 +46,9 @@ call plastic_implied_basal_velocity(z_srf, H, tau_b, mask, smb, dx, dy, rheo, u_
                                     [, u_balance, u_def, Q, slope_eps, H_min, stat])
 call plastic_solve_smb(ps, z_bed, z_sl, smb, mask, rheo, slide [, warm, ctrl, H_init, tau_d, stat, margin_frac])
 call plastic_margin_frac_from_sdist(sdist, mask, dx, dy, frac)  ! margin_frac from a signed distance
+call plastic_smb_flux_divergence(ps, z_bed, z_sl, mask, rheo, slide, smb [, margin_frac, stat])
+                                   ! implied SMB of ps%H for method "steady" (same face fluxes)
+l = plastic_has_lis()              ! built with lis=1
 u = plastic_basal_velocity(slide, tau_b); u = plastic_deformational_velocity(rheo, tau, H)
 ```
 
@@ -209,7 +215,7 @@ The residual of `plastic_stress_residual` is cell-centred (H of the cell): it is
 surface lies below the cell's bed, and O(dx) elsewhere. Its scheme-consistent
 counterpart is `plastic_residual` (the Godunov residual of z_s), < 1e-8 m.
 
-## SMB-driven reconstruction: why it does not converge
+## SMB-driven reconstruction, method "routing": why it does not converge
 
 `plastic_solve_smb` (Julia `diva_reconstruct`) iterates H -> T(H): route the SMB down
 z_s = z_b + H with the MFD weights (flux Q), invert the DIVA flux law per cell for tau_d,
@@ -250,7 +256,8 @@ with Q <= 0 (tau_d = 0, the surface goes flat) carry the largest moves (`smb_dia
 classes). Under-relaxation would have to scale like slope dx / H, case by case, and still
 fails from a far start. This is structural, not a tuning problem.
 
-Structural fix (not implemented in the library; prototype `compare/smb_sia_proto.f90`):
+Structural fix (implemented as `ctrl%method = "steady"`, below; first prototyped with
+explicit pseudo-time steps in `compare/smb_sia_proto.f90`):
 solve mass conservation directly, div q = smb on the mask with the same membrane-free
 DIVA flux, q = -H (u_b(tau) + u_def(tau, H)) grad z_s/|grad z_s|, tau = rho_i g H |grad z_s|.
 This is the steady SIA with sliding, a monotone degenerate-elliptic problem (obstacle
@@ -264,13 +271,11 @@ fluxes, dt = 0.2 dx^2 / max D, ice-free cells fixed at z_b + H_flt):
 | grl32, nh32_0ka (implied) | interior steady; margin cells cycle on the H = 0 obstacle (max abs(dH/dt) 24, 229 m/yr): the MFD-implied SMB puts all terminal flux into the margin cells as ablation, while the SIA flux leaves through the margin faces, so this forcing is inconsistent with it |
 | synth150 (dx = 2 km, implied) | dt = 2e-3 yr: 1e6 steps (~30 min) reach only ~2 kyr, rms 35 m from the plastic solution (explicit stepping too slow at km resolution); same margin cycling |
 
-For the library this needs decisions: an implicit (Picard/Newton) solver with a
-dependency-free linear solver for km-scale grids, the margin/outflow treatment (and a
-matching implied-SMB operator, replacing the MFD closures, so the plastic solution stays
-a fixed point), and how the result relates to the plastic modes (tau_d = rho_i g H
-abs(grad z_s) becomes an output).
+The explicit prototype was too slow at km resolution, and the MFD-implied SMB did not match
+its margin treatment; the steady method below solves both (implicit Newton, and an
+implied SMB built on the same face fluxes).
 
-## SMB-driven reconstruction: direct steady formulation (design)
+## SMB-driven reconstruction, method "steady": direct formulation
 
 `ctrl%method = "steady"` (default) solves steady mass conservation directly; `"routing"`
 keeps the Julia iteration (conditionally stable, see above).
@@ -291,7 +296,14 @@ complementarity problem
 
 ### Discretisation (finite volumes, staggered fluxes)
 
-Interior face between ice cells P and E (x shown, y alike): H_f = (H_P + H_E)/2,
+Interior face between ice cells P and E (x shown, y alike): H_f = (1 - w) H_up + w H_dn
+(up/down by surface), w = min(1/2, H_up/(4 |s_P - s_E|)): the mean (Mahaffy) where the
+surface drop across the face is small against the thickness, limited towards the upstream
+value where it is not. The limit keeps the face flux non-increasing in the downstream
+thickness (dq/dH_dn <= 0 for q ~ H^(p+1) g^p, p >= 1: Glen and all sliding laws), so F_P is
+non-increasing in its neighbours' H (an M-function). With the plain mean it is not, and
+the active-set Newton stalled on cells next to H = 0 (GRL-32KM at 2e-2 m/yr); with full
+upwinding it converges but the Vialov error grows from 0.3 % to 2.3 % at 2.5 km.
 s_x = (s_E - s_P)/dx, s_y = mean of the central y-differences of s at P and E,
 |grad s| = sqrt(s_x^2 + s_y^2), tau_f = rho_i g H_f |grad s|,
 q_x = -H_f U(tau_f, H_f) s_x/|grad s| (0 where grad s = 0). Ice-free cells carry
@@ -324,22 +336,23 @@ it (fixed point; exact up to the solver tolerance).
 
 Pseudo-transient continuation with a semismooth Newton step per pseudo-time step:
 
-    G(H) = (H - H_k)/dt_k + F(H),  Phi(H) = min(H, dt_k G(H)) = 0.
+    G(H) = (H - H_k)/dt_k + F(H),  Phi(H) = min(H, c_P G(H)) = 0,  c_P = 1/(1/dt_k + dF_P/dH_P).
 
-- Active set A = {cells with H <= dt_k G} (an explicit pseudo-time step would empty the
-  cell; the set shrinks with dt, so a rejected step is retried with fewer active
-  cells): equation H = 0. Inactive cells: the Newton row
+- Active set A = {cells with H <= c_P G}: the cell's own Newton step would empty it (c_P = dt
+  where the diagonal is not positive). A fixed c (1 yr) zeroed thick, slowly thinning
+  cells at large dt; c = dt did the same. Equation H = 0 on A. Inactive cells: the Newton row
   of G, (1/dt) d_P + sum_K dF_P/dH_K d_K = -G_P, with d_K = -H_K for K in A moved to the
-  right-hand side. New iterate H + d, then max(., 0) (projection).
+  right-hand side. New iterate max(H + lam d, 0), lam = 1, 1/2, ... (up to 6 halvings)
+  until the rms residual decreases.
 - Jacobian dF/dH by finite differences with 9 colours: F_P depends on H in the 3 x 3
   block around P, so perturbing every third cell in x and y at once gives one column
   per cell per residual evaluation (10 residual evaluations per Newton step; works for all
   three sliding laws).
-- dt: switched evolution relaxation, dt_{k+1} = dt_k ||F_k||/||F_{k+1}|| (at least 1.5 dt_k
+- dt: switched evolution relaxation on the rms residual, dt_{k+1} = dt_k ||F_k||/||F_{k+1}|| (at least 1.5 dt_k
   after a step that did not increase the residual, so that a slowly decaying residual
   cannot stall dt), within
-  [ctrl%dt0, ctrl%dt_max]; a step that increases the residual ten-fold is rejected and dt
-  halved. The pseudo-time term keeps the system well posed at divides (where dF/dH
+  [ctrl%dt0, ctrl%dt_max]; a step that increases the rms residual ten-fold is rejected and
+  dt halved. The pseudo-time term keeps the system well posed at divides (where dF/dH
   vanishes with |grad s|) and at the start.
 - Converged when max over the cells of |min(H, F)| (F alone on ice, max(-F, 0) on
   ice-free cells) < ctrl%res_tol [m/yr].
@@ -356,11 +369,53 @@ Residual, Jacobian colouring, CSR assembly and the mat-vec run in parallel loops
 rows (each row written by one thread: deterministic). Dot products sum fixed blocks of
 4096 entries in parallel and the block sums sequentially, so they do not depend on the
 thread count; the ILU(0) triangular solves are sequential. The built-in solver is
-therefore bit-reproducible for any thread count. Lis uses OpenMP reductions: with
-`lis=1` results can differ between thread counts at the level of the linear tolerance
-(the converged steady state agrees to ctrl%res_tol). The fast sweeping gets an optional
-wavefront ordering (cells of one anti-diagonal in parallel), which is the same
-Gauss-Seidel order and hence bit-identical to the sequential sweep.
+therefore bit-reproducible for any thread count (tested: 1 vs 4 threads). Lis uses OpenMP
+reductions: with `lis=1` results differ between thread counts at the level of the linear
+tolerance (observed 6e-10 to 1.5e-9 m on GRL-32KM). The fast sweeping has an optional
+wavefront ordering (`par%sweep = "wavefront"`, cells of one anti-diagonal in parallel),
+the same Gauss-Seidel order and bit-identical to the serial sweep (tested in all modes).
+
+### Results
+
+Tests (`tests/test_steady.f90`, built-in solver unless noted):
+
+| test | result |
+|---|---|
+| plastic fixed point under its implied SMB, bump 40 x 40 at 2 km | H_p is a root (0 steps from H_p); cold start 16 steps, 0.018 s, max abs(H - H_p) 2e-12 m |
+| same, cap 150 x 150 at 2 km | cold start 37 steps, 1.2 s (1 thread), max abs(H - H_p) 2e-11 m |
+| Lis (lis=1, 8 threads) vs built-in | 5e-13 m |
+| built-in, 1 vs 4 threads | bit-identical |
+| Vialov profile (n = 3, a = 0.3 m/yr, L = 300 km), dx = 20, 10, 5, 2.5 km | max rel error (x <= 0.9 L) 2.6, 1.1, 0.61, 0.32 % (order 0.9-1.2); volume +0.87, +0.45, +0.23, +0.12 %; 22-23 steps |
+
+Real data and thread scaling (`compare/bench_threads.sh`, Levante shared node, ifx,
+openmp=1 lis=1; wall time of plastic_solve_smb from the cold start):
+
+| case | steps | residual [m/yr] | 1 thread | 4 | 8 | 16 (built-in / Lis) |
+|---|---|---|---|---|---|---|
+| grl32, MAR v3.14, Coulomb | 28 | 4e-8 | 0.09 / 0.10 s | 0.055 / 0.071 | 0.049 / 0.068 | 0.054 / 0.077 |
+| synth150 (its input SMB) | 31 | 2e-10 | 1.37 / 1.27 s | 0.92 / 0.66 | 0.85 / 0.53 | 0.93 / 0.55 |
+| nh32_0ka, implied SMB of its plastic solution | 32 | 2e-10 | 0.50 / 0.52 s | 0.30 / 0.34 | 0.27 / 0.28 | 0.28 / 0.29 |
+
+On nh32_0ka the solver returns the plastic solution (max abs(H - H_plastic) 6e-10 m). On
+grl32 with MAR, 17 of the 1710 mask cells end ice-free (ablation exceeds the inflow;
+mean H 1812 m). The scaling is modest (the residual evaluations of the coloured Jacobian
+dominate, the built-in ILU is sequential); Lis helps on the larger grid.
+
+Eikonal, surface mode, best of 5 (serial / wavefront), same job:
+
+| grid | 1 thread | 4 | 8 | 16 |
+|---|---|---|---|---|
+| synth300 (300 x 300) | 12.4 / 14.1 ms | 12.4 / 12.2 | 12.4 / 12.4 | 12.4 / 16.4 |
+| nh32_20ka (276 x 276) | 14.0 / 16.2 ms | 14.0 / 13.8 | 14.0 / 14.6 | 18.7 / 16.4 |
+
+An earlier run of the same job gave 8.6 / 6.9 / 8.5 ms (wavefront, 4 / 8 / 16 threads on
+synth300): the gain is at most 1.8x and not reproducible on a shared node. A solve takes
+~10 ms and ~10 sweeps; each sweep has nx + ny barriers. Not worth it at these sizes:
+`par%sweep = "serial"` stays the default.
+
+Status of `ctrl%method = "routing"`: kept for parity with PlasticIceSheet.jl; stable
+only for relax < 2/(1 - lambda), lambda ~ -H/(slope dx) (0.003-0.04 in the cases above),
+see the diagnosis above. Use "steady".
 
 ## Build
 
@@ -379,14 +434,23 @@ INC_PLASTIC  = -I$(PLASTICROOT)/libplastic/include
 LIB_PLASTIC  = -L$(PLASTICROOT)/libplastic/include -lplastic
 ```
 
-Options: `debug=1`, `openmp=1` (adds the OpenMP flag; the library has no OpenMP
-regions), `pic=1`. The fragments `config/<machine>_<compiler>` set `FC`, `FFLAGS`
+Options: `debug=1`, `openmp=1` (OpenMP in the steady solver, the built-in linear
+solver and the optional wavefront sweep), `pic=1`, `lis=1` (Lis for the steady solver's
+linear solves; ifx only, fesm-utils' Lis: `LISROOT` defaults to
+`/work/ba1442/robinson/models/fesm-utils/lis/lis-omp` with openmp=1, `lis-serial`
+otherwise). With lis=1 a host links `-L$(LISROOT)/lib -llis` after `-lplastic`:
+
+```make
+make -C PlasticIceSheet static openmp=1 lis=1 LISROOT=$(LISROOT)
+LIB_PLASTIC = -L$(PLASTICROOT)/libplastic/include -lplastic -L$(LISROOT)/lib -llis
+``` The fragments `config/<machine>_<compiler>` set `FC`, `FFLAGS`
 and `DFLAGS_*`; ifx uses `-O3 -march=core-avx2 -fp-model precise`.
 
 ## Tests
 
-`make check` runs `tests/test_core.f90`, `tests/test_closures.f90` and
-`tests/test_surface.f90` (see [Mode "surface"](#mode-surface)): the Julia test
+`make check` runs `tests/test_core.f90`, `tests/test_closures.f90`,
+`tests/test_surface.f90` (see [Mode "surface"](#mode-surface)) and
+`tests/test_steady.f90` (the steady SMB-driven solver): the Julia test
 set (godunov kernel, Nye profile, flat vs full, full over bed relief and its residual,
 constitutive laws, DIVA velocity, closure B round trip `balance_flux(smb_implied) = u H`
 to 1e-16, balance flux and A <-> B consistency, implied basal velocity, the SMB-driven

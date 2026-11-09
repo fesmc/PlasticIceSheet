@@ -8,7 +8,8 @@ eikonal problem by fast sweeping, on a prescribed grounded-ice mask (`"flat"` mo
 start). Mode `"surface"` (not in the Julia package, recommended) solves the surface
 equation for z_s directly, with the bed relief and no outer iteration. Closures: Glen
 deformation, linear / Weertman / regularized-Coulomb sliding, DIVA velocity, MFD balance
-flux and velocity, implied SMB, and the SMB-driven reconstruction.
+flux and velocity, implied SMB, and the SMB-driven reconstruction (steady mass
+conservation solved directly by Newton; optional Lis and OpenMP).
 
 ```bash
 make static config=dkrz_levante_ifx   # -> libplastic/include/libplastic.a + .mod
