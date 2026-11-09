@@ -250,10 +250,81 @@ contains
         end do
     end subroutine steady_tau
 
+    ! Outflow through the margin faces of each ice cell [m ice / yr, >= 0], split by the
+    ! ice-free neighbour: marine where its bed lies below sea level (flotation thickness
+    ! hm > 0), land elsewhere. Faces on the array edge carry no flux.
+    subroutine margin_outflow(nx, ny, mask, hm, qx, qy, dx, dy, ql, qm)
+        integer,  intent(in)  :: nx, ny
+        logical,  intent(in)  :: mask(nx, ny)
+        real(dp), intent(in)  :: hm(nx, ny), qx(0:nx, ny), qy(nx, 0:ny), dx, dy
+        real(dp), intent(out) :: ql(nx, ny), qm(nx, ny)
+        integer :: i, j
+        ql = 0.0_dp
+        qm = 0.0_dp
+        do j = 1, ny
+            do i = 1, nx - 1
+                if (mask(i, j) .and. .not. mask(i + 1, j)) call add(i, j, qx(i, j) / dx, hm(i + 1, j))
+                if (mask(i + 1, j) .and. .not. mask(i, j)) call add(i + 1, j, -qx(i, j) / dx, hm(i, j))
+            end do
+        end do
+        do j = 1, ny - 1
+            do i = 1, nx
+                if (mask(i, j) .and. .not. mask(i, j + 1)) call add(i, j, qy(i, j) / dy, hm(i, j + 1))
+                if (mask(i, j + 1) .and. .not. mask(i, j)) call add(i, j + 1, -qy(i, j) / dy, hm(i, j))
+            end do
+        end do
+    contains
+        subroutine add(ip, jp, r, h)
+            integer,  intent(in) :: ip, jp
+            real(dp), intent(in) :: r, h
+            if (h > 0.0_dp) then
+                qm(ip, jp) = qm(ip, jp) + r
+            else
+                ql(ip, jp) = ql(ip, jp) + r
+            end if
+        end subroutine add
+    end subroutine margin_outflow
+
+    ! Surface velocity at the cell centres [m/yr] of the same closure as the face fluxes:
+    ! u_b(tau) + 2A/(n+1) tau^n H along -grad s, tau = rho_i g H |grad s| (central slopes of
+    ! s, the margin surface on the ice-free cells), capped as the fluxes; 0 off the mask.
+    subroutine surface_velocity(nx, ny, H, s, mask, dx, dy, rg, taucap, code, slide, rheo, ux, uy)
+        integer,                 intent(in)  :: nx, ny, code
+        real(dp),                intent(in)  :: H(nx, ny), s(nx, ny), dx, dy, rg, taucap
+        logical,                 intent(in)  :: mask(nx, ny)
+        type(plastic_sliding_t), intent(in)  :: slide
+        type(plastic_glen_t),    intent(in)  :: rheo
+        real(dp),                intent(out) :: ux(nx, ny), uy(nx, ny)
+        integer  :: i, j
+        real(dp) :: gx, gy, g, tau, u
+        !$omp parallel do private(i, j, gx, gy, g, tau, u) schedule(static)
+        do j = 1, ny
+            do i = 1, nx
+                ux(i, j) = 0.0_dp
+                uy(i, j) = 0.0_dp
+                if (.not. (mask(i, j) .and. H(i, j) > 0.0_dp)) cycle
+                gx = cslope(nx, ny, s, i, j, dx, 1)
+                gy = cslope(nx, ny, s, i, j, dy, 2)
+                g = hypot(gx, gy)
+                if (.not. g > 0.0_dp) cycle
+                tau = min(rg * H(i, j) * g, taucap)
+                u = basal_velocity_code(code, slide, tau) + &
+                    deformational_velocity(rheo, tau, H(i, j)) * (rheo%n + 2.0_dp) / (rheo%n + 1.0_dp)
+                ux(i, j) = -u * gx / g
+                uy(i, j) = -u * gy / g
+            end do
+        end do
+        !$omp end parallel do
+    end subroutine surface_velocity
+
     ! Implied SMB of the geometry on ps (ps%H): the divergence of the steady solver's face
     ! fluxes [m ice / yr] (closure B of ctrl%method = "steady"). The margin position is
-    ! margin_frac or par%margin, as in plastic_solve.
-    subroutine plastic_smb_flux_divergence(ps, z_bed, z_sl, mask, rheo, slide, smb, margin_frac, stat)
+    ! margin_frac or par%margin, as in plastic_solve. Optional: the outflow through the
+    ! margin faces of each ice cell, to land (q_land) and to the ocean (q_marine) [m ice / yr,
+    ! >= 0; their sum over the mask is that of smb], and the surface velocity of the same
+    ! closure at the cell centres (us_x, us_y) [m/yr].
+    subroutine plastic_smb_flux_divergence(ps, z_bed, z_sl, mask, rheo, slide, smb, margin_frac, stat, &
+                                           q_land, q_marine, us_x, us_y)
         type(plastic_t),         intent(inout) :: ps
         real(dp),                intent(in)    :: z_bed(:,:), z_sl(:,:)
         logical,                 intent(in)    :: mask(:,:)
@@ -262,8 +333,10 @@ contains
         real(dp),                intent(out)   :: smb(:,:)
         real(dp), optional,      intent(in)    :: margin_frac(:,:)
         integer,  optional,      intent(out)   :: stat
+        real(dp), optional,      intent(out)   :: q_land(:,:), q_marine(:,:), us_x(:,:), us_y(:,:)
         integer  :: code
         real(dp) :: taucap
+        real(dp), allocatable :: ql(:,:), qm(:,:), ux(:,:), uy(:,:)
 
         ps%stat = PLASTIC_OK
         ps%msg  = ""
@@ -276,6 +349,10 @@ contains
             call check_shape(ps, size(z_sl, 1),  size(z_sl, 2),  "z_sl")
             call check_shape(ps, size(mask, 1),  size(mask, 2),  "mask")
             call check_shape(ps, size(smb, 1),   size(smb, 2),   "smb")
+            if (present(q_land))   call check_shape(ps, size(q_land, 1),   size(q_land, 2),   "q_land")
+            if (present(q_marine)) call check_shape(ps, size(q_marine, 1), size(q_marine, 2), "q_marine")
+            if (present(us_x))     call check_shape(ps, size(us_x, 1),     size(us_x, 2),     "us_x")
+            if (present(us_y))     call check_shape(ps, size(us_y, 1),     size(us_y, 2),     "us_y")
             call margin_spacing(ps, mask, margin_frac)
         end if
         if (present(stat)) stat = ps%stat
@@ -289,6 +366,19 @@ contains
                              ps%dx, ps%dy, ps%par%rho_i * ps%par%g, taucap, code, slide, rheo, &
                              ps%wk%sS, ps%wk%qx, ps%wk%qy, ps%wk%sF)
         smb = ps%wk%sF
+        if (present(q_land) .or. present(q_marine)) then
+            allocate(ql(ps%nx, ps%ny), qm(ps%nx, ps%ny))
+            call margin_outflow(ps%nx, ps%ny, mask, ps%wk%sHm, ps%wk%qx, ps%wk%qy, ps%dx, ps%dy, ql, qm)
+            if (present(q_land))   q_land   = ql
+            if (present(q_marine)) q_marine = qm
+        end if
+        if (present(us_x) .or. present(us_y)) then
+            allocate(ux(ps%nx, ps%ny), uy(ps%nx, ps%ny))
+            call surface_velocity(ps%nx, ps%ny, ps%H, ps%wk%sS, mask, ps%dx, ps%dy, ps%par%rho_i * ps%par%g, &
+                                  taucap, code, slide, rheo, ux, uy)
+            if (present(us_x)) us_x = ux
+            if (present(us_y)) us_y = uy
+        end if
     end subroutine plastic_smb_flux_divergence
 
     ! Steady solve from the initial thickness in ps%H (ps%wk%dfac set by the caller).

@@ -46,8 +46,12 @@ call plastic_implied_basal_velocity(z_srf, H, tau_b, mask, smb, dx, dy, rheo, u_
                                     [, u_balance, u_def, Q, slope_eps, H_min, stat])
 call plastic_solve_smb(ps, z_bed, z_sl, smb, mask, rheo, slide [, warm, ctrl, H_init, tau_d, stat, margin_frac])
 call plastic_margin_frac_from_sdist(sdist, mask, dx, dy, frac)  ! margin_frac from a signed distance
-call plastic_smb_flux_divergence(ps, z_bed, z_sl, mask, rheo, slide, smb [, margin_frac, stat])
-                                   ! implied SMB of ps%H for method "steady" (same face fluxes)
+call plastic_smb_flux_divergence(ps, z_bed, z_sl, mask, rheo, slide, smb [, margin_frac, stat, &
+                                  q_land, q_marine, us_x, us_y])
+                                   ! implied SMB of ps%H for method "steady" (same face fluxes); optional:
+                                   ! the outflow through each ice cell's margin faces to land / to the ocean
+                                   ! (the ice-free neighbour below sea level) [m ice/yr, >= 0, sum = sum(smb)],
+                                   ! the surface velocity of the same closure at the cell centres [m/yr]
 l = plastic_has_lis()              ! built with lis=1
 u = plastic_basal_velocity(slide, tau_b); u = plastic_deformational_velocity(rheo, tau, H)
 ```

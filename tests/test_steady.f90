@@ -16,6 +16,7 @@ program test_steady
     call test_fixed_point(40, 2000.0_dp, "bump 40 x 40, dx 2 km")
     call test_fixed_point(150, 2000.0_dp, "cap 150 x 150, dx 2 km")
     call test_vialov()
+    call test_margin_outflow()
     call finish("test_steady")
 
 contains
@@ -103,6 +104,65 @@ contains
         !$ end if
         call plastic_end(p0); call plastic_end(ps)
     end subroutine test_fixed_point
+
+    ! Margin outflow and surface velocity of plastic_smb_flux_divergence on a 40 x 40 cap: the
+    ! outflow through the margin faces sums to the divergence over the mask (interior faces
+    ! cancel); with the sea above the bed west of the cap the outflow there is marine, east of it
+    ! land; the surface speed is positive on the ice and points down the surface.
+    subroutine test_margin_outflow()
+        integer,  parameter :: n = 40
+        real(dp), parameter :: dx = 2000.0_dp
+        type(plastic_t)         :: ps
+        type(plastic_par_t)     :: par
+        type(plastic_glen_t)    :: r
+        type(plastic_sliding_t) :: sl
+        real(dp), allocatable :: z_b(:,:), z_sl(:,:), tb(:,:), smb(:,:), ql(:,:), qm(:,:), ux(:,:), uy(:,:)
+        logical,  allocatable :: mask(:,:)
+        real(dp) :: x, y, L, sdiv, sout
+        integer  :: i, j, st
+        logical  :: west_marine, east_land, down
+
+        write(*, '(a)') "margin outflow and surface velocity of the implied SMB"
+        allocate(z_b(n, n), z_sl(n, n), tb(n, n), smb(n, n), ql(n, n), qm(n, n), ux(n, n), uy(n, n), mask(n, n))
+        L = n * dx
+        do j = 1, n
+            do i = 1, n
+                x = (i - 0.5_dp) * dx - 0.5_dp * L
+                y = (j - 0.5_dp) * dx - 0.5_dp * L
+                z_b(i, j)  = 300.0_dp * exp(-(x * x + y * y) / (2.0_dp * (0.25_dp * L)**2))
+                mask(i, j) = hypot(x, y) <= 0.375_dp * L
+                z_sl(i, j) = -1.0e4_dp
+                if (x < 0.0_dp) z_sl(i, j) = z_b(i, j) + 50.0_dp     ! the sea west of the divide
+            end do
+        end do
+        tb = 1.0e5_dp
+        r%A = 1.0e-16_dp; r%n = 3.0_dp
+        sl%law = "weertman"; sl%beta = 1.0e4_dp; sl%m = 3.0_dp
+        par%mode = "surface"
+        call plastic_init(ps, n, n, dx, dx, par)
+        call plastic_solve(ps, z_b, z_sl, tb, mask)
+        call plastic_smb_flux_divergence(ps, z_b, z_sl, mask, r, sl, smb, stat=st, q_land=ql, q_marine=qm, us_x=ux, us_y=uy)
+        call check(st == PLASTIC_OK, "implied SMB with the margin outflow computed")
+        sdiv = sum(smb, mask = mask); sout = sum(ql + qm, mask = mask)
+        call check_close(sout, sdiv, 1.0e-10_dp, 0.0_dp, "margin outflow sums to the divergence")
+        call check(all(ql >= 0.0_dp) .and. all(qm >= 0.0_dp), "outflow non-negative")
+        west_marine = .true.; east_land = .true.; down = .true.
+        do j = 1, n
+            do i = 1, n
+                x = (i - 0.5_dp) * dx - 0.5_dp * L
+                if (x < -dx .and. ql(i, j) > 0.0_dp) west_marine = .false.
+                if (x > dx .and. qm(i, j) > 0.0_dp) east_land = .false.
+                if (mask(i, j) .and. ps%H(i, j) > 0.0_dp) then
+                    if (.not. hypot(ux(i, j), uy(i, j)) > 0.0_dp) down = .false.
+                end if
+            end do
+        end do
+        call check(west_marine .and. sum(qm) > 0.0_dp, "west of the divide the outflow is marine")
+        call check(east_land .and. sum(ql) > 0.0_dp, "east of it the outflow is to land")
+        call check(down .and. ux(n / 2 + 8, n / 2) > 0.0_dp .and. ux(n / 2 - 8, n / 2) < 0.0_dp, &
+                   "surface speed positive on the ice, away from the divide")
+        call plastic_end(ps)
+    end subroutine test_margin_outflow
 
     ! Vialov profile: divide at x = 0 (closed array edge), margin at x = L (cell face),
     ! smb = a, no sliding (linear law, beta = 1e30): H = [2 (a/G)^(1/n) (L^p - x^p)]^(n/(2n+2)),
