@@ -29,7 +29,8 @@ contains
         end do
     end subroutine circle_mask
 
-    ! Flat-mode plastic solve of a uniform tau_b on a flat bed (geometry for the tests).
+    ! Flat-mode plastic solve of a uniform tau_b on a flat bed (geometry for the tests),
+    ! margin at the ice-free cell centre as in PlasticIceSheet.jl.
     subroutine flat_cap(ps, nx, ny, dx, tau, mask, max_sweeps)
         type(plastic_t), intent(inout) :: ps
         integer,         intent(in)    :: nx, ny, max_sweeps
@@ -38,6 +39,7 @@ contains
         type(plastic_par_t) :: par
         real(dp) :: zero(nx, ny), tb(nx, ny)
         par%mode = "flat"; par%max_sweeps = max_sweeps; par%tol = 1.0e-9_dp
+        par%margin = "centre"           ! the PlasticIceSheet.jl tests (exact symmetry at the divide)
         zero = 0.0_dp; tb = tau
         call plastic_init(ps, nx, ny, dx, dx, par)
         call plastic_solve(ps, zero, zero, tb, mask)
@@ -187,6 +189,7 @@ contains
         type(plastic_glen_t)     :: r
         type(plastic_sliding_t)  :: sl
         type(plastic_smb_ctrl_t) :: ctrl
+        type(plastic_par_t)      :: pcen
         real(dp) :: z_b(nx, ny), z_sl(nx, ny), tb(nx, ny), ux(nx, ny), uy(nx, ny), speed(nx, ny)
         real(dp) :: smb(nx, ny), H0(nx, ny), Hg(nx, ny), smb2(nx, ny), t0, tw, tc
         real(dp), allocatable :: rel(:), srt(:)
@@ -196,6 +199,7 @@ contains
         write(*, '(a)') "SMB-driven reconstruction"
         call circle_mask(mask, 21.0_dp, 21.0_dp, 16.0_dp)
         call flat_cap(p0, nx, ny, dx, tau, mask, 600)
+        pcen%margin = "centre"          ! as the reference geometry (flat_cap)
         H0 = p0%H
         z_b = 0.0_dp; z_sl = 0.0_dp; tb = tau
         r%A = 1.0e-16_dp; r%n = 3.0_dp
@@ -209,7 +213,7 @@ contains
         end do
 
         ! The plastic solution is a fixed point of the SMB-driven map.
-        call plastic_init(pr, nx, ny, dx, dx)
+        call plastic_init(pr, nx, ny, dx, dx, pcen)
         call plastic_solve_smb(pr, z_b, z_sl, smb, mask, r, sl, H_init=H0, stat=st)
         write(*, '(a,es10.3,a,i0)') "        fixed point max|H - H0| ", maxval(abs(pr%H - H0), mask=mask), &
             " m, n_outer ", pr%n_outer_used
@@ -239,8 +243,8 @@ contains
         ! Warm start: after a 5 % change of smb, warm and cold reach the same geometry.
         ctrl = plastic_smb_ctrl_t()
         ctrl%tol = 1.0e-2_dp
-        call plastic_init(pw, nx, ny, dx, dx)
-        call plastic_init(pc, nx, ny, dx, dx)
+        call plastic_init(pw, nx, ny, dx, dx, pcen)
+        call plastic_init(pc, nx, ny, dx, dx, pcen)
         call plastic_solve_smb(pw, z_b, z_sl, smb, mask, r, sl, ctrl=ctrl)
         smb2 = 1.05_dp * smb
         t0 = wall_time()

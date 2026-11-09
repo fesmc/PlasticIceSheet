@@ -76,120 +76,160 @@ contains
         call check(nbad_mono == 0, "update nondecreasing in a and b (monotone)")
     end subroutine test_kernel
 
-    subroutine solve_mode(mode, nx, ny, dx, z_b, tb, mask, H, n_sweeps)
+    subroutine solve_mode(mode, nx, ny, dx, z_b, tb, mask, H, n_sweeps, margin, margin_frac)
         character(len=*), intent(in)  :: mode
         integer,          intent(in)  :: nx, ny
         real(dp),         intent(in)  :: dx, z_b(nx, ny), tb(nx, ny)
         logical,          intent(in)  :: mask(nx, ny)
         real(dp),         intent(out) :: H(nx, ny)
-        integer, optional, intent(out) :: n_sweeps
+        integer,          optional, intent(out) :: n_sweeps
+        character(len=*), optional, intent(in)  :: margin
+        real(dp),         optional, intent(in)  :: margin_frac(nx, ny)
         type(plastic_t)     :: ps
         type(plastic_par_t) :: par
         real(dp) :: z_sl(nx, ny)
         z_sl = -1.0e4_dp
         par%mode = mode; par%max_sweeps = 1000; par%tol = 1.0e-10_dp
         par%n_outer = 3000; par%outer_tol = 1.0e-7_dp; par%relax = 0.4_dp
+        if (present(margin)) par%margin = margin
         call plastic_init(ps, nx, ny, dx, dx, par)
-        call plastic_solve(ps, z_b, z_sl, tb, mask)
+        call plastic_solve(ps, z_b, z_sl, tb, mask, margin_frac=margin_frac)
         if (.not. ps%converged) write(*, '(a,a,a,a)') "        ", mode, ": ", trim(ps%msg)
         H = ps%H
         if (present(n_sweeps)) n_sweeps = ps%n_sweeps
         call plastic_end(ps)
     end subroutine solve_mode
 
-    ! (i) 1-D strip between land margins: H = sqrt(2 k d). surface and flat reproduce it
-    ! to rounding at every dx; the cell-centred update (u - a)(u - z_b) = k dx, solved
-    ! here by its 1-D recursion, is sqrt(1/2) low at the first cell.
+    ! (i) 1-D strip between land margins at sub-cell positions: margin f dx inside the
+    ! ice-free end cells (f = 0 "centre", 0.5 "face", and arbitrary margin_frac), so
+    ! H = sqrt(2 k d) with d the distance to the nearer margin. Surface and flat
+    ! reproduce it to rounding for every f and dx: no half-cell offset. The cell-centred
+    ! surface update (u - a)(u - z_b) = k dx, solved by its 1-D recursion with the margin
+    ! at the face, is sqrt(1/2) low at the first cell.
     subroutine test_nye_strip()
         real(dp), parameter :: L = 64000.0_dp, k = 1.0e5_dp / rho_g, d_fix = 8000.0_dp
-        real(dp) :: dxs(5), es(5), ef(5), ec(5), ec_fix(5), dx, d, ex, hc, hprev
-        real(dp), allocatable :: z_b(:,:), tb(:,:), Hs(:,:), Hf(:,:)
+        real(dp) :: dxs(3), fl(4), fr(4), es, ef, emax, ec(3), ec_fix(3), dx, d, ex, hc, hprev
+        real(dp), allocatable :: z_b(:,:), tb(:,:), Hs(:,:), Hf(:,:), mf(:,:)
         logical,  allocatable :: mask(:,:)
-        integer  :: m, nx, i, j
+        character(len=8) :: lbl(4)
+        integer  :: m, c, nx, i, j
 
-        write(*, '(a)') "(i) Nye profile, 1-D strip: max rel err (interior), and at d = 8 km"
-        dxs = [4000.0_dp, 2000.0_dp, 1000.0_dp, 500.0_dp, 250.0_dp]
-        do m = 1, 5
+        write(*, '(a)') "(i) Nye profile, 1-D strip, margin at sub-cell positions: max rel err"
+        dxs = [4000.0_dp, 1000.0_dp, 250.0_dp]
+        lbl = [character(len=8) :: "centre", "face", "frac", "frac"]
+        fl  = [0.0_dp, 0.5_dp, 0.3_dp, 0.95_dp]
+        fr  = [0.0_dp, 0.5_dp, 0.77_dp, 0.05_dp]
+        emax = 0.0_dp
+        do m = 1, 3
             dx = dxs(m)
             nx = nint(L / dx) + 1
-            allocate(z_b(nx, 4), tb(nx, 4), Hs(nx, 4), Hf(nx, 4), mask(nx, 4))
+            allocate(z_b(nx, 4), tb(nx, 4), Hs(nx, 4), Hf(nx, 4), mask(nx, 4), mf(nx, 4))
             z_b = 0.0_dp; tb = 1.0e5_dp
             mask = .true.; mask(1, :) = .false.; mask(nx, :) = .false.
-            call solve_mode("surface", nx, 4, dx, z_b, tb, mask, Hs)
-            call solve_mode("flat",    nx, 4, dx, z_b, tb, mask, Hf)
-            es(m) = 0.0_dp; ef(m) = 0.0_dp; ec(m) = 0.0_dp
-            hprev = 0.0_dp
-            j = 2
-            do i = 2, nx / 2
-                d  = dx * (i - 1)
-                ex = sqrt(2.0_dp * k * d)
-                ! cell-centred recursion: h (h - hprev) = k dx
-                hc = (hprev + sqrt(hprev**2 + 4.0_dp * k * dx)) / 2.0_dp
-                hprev = hc
-                es(m) = max(es(m), abs(Hs(i, j) - ex) / ex)
-                ef(m) = max(ef(m), abs(Hf(i, j) - ex) / ex)
-                ec(m) = max(ec(m), abs(hc - ex) / ex)
-                if (abs(d - d_fix) < 0.5_dp * dx) ec_fix(m) = abs(hc - ex) / ex
+            do c = 1, 4
+                mf = 0.0_dp; mf(1, :) = fl(c); mf(nx, :) = fr(c)
+                if (c <= 2) then
+                    call solve_mode("surface", nx, 4, dx, z_b, tb, mask, Hs, margin=lbl(c))
+                    call solve_mode("flat",    nx, 4, dx, z_b, tb, mask, Hf, margin=lbl(c))
+                else
+                    call solve_mode("surface", nx, 4, dx, z_b, tb, mask, Hs, margin_frac=mf)
+                    call solve_mode("flat",    nx, 4, dx, z_b, tb, mask, Hf, margin_frac=mf)
+                end if
+                es = 0.0_dp; ef = 0.0_dp
+                j = 2
+                do i = 2, nx - 1
+                    d  = dx * min(real(i - 1, dp) - fl(c), real(nx - i, dp) - fr(c))
+                    ex = sqrt(2.0_dp * k * d)
+                    es = max(es, abs(Hs(i, j) - ex) / ex)
+                    ef = max(ef, abs(Hf(i, j) - ex) / ex)
+                end do
+                emax = max(emax, es, ef)
+                write(*, '(a,f6.0,a,a,a,2f5.2,a,es9.2,a,es9.2)') "        dx ", dx, " ", lbl(c), " f =", fl(c), fr(c), &
+                    ": surface ", es, ", flat ", ef
             end do
-            write(*, '(a,f7.0,a,es9.2,a,es9.2,a,es9.2,a,es9.2)') "        dx ", dx, ": surface ", es(m), &
-                ", flat ", ef(m), ", cell-centred ", ec(m), " (", ec_fix(m), " at 8 km)"
-            deallocate(z_b, tb, Hs, Hf, mask)
+            ! cell-centred recursion from a face margin: h (h - hprev) = k d, first d = dx/2
+            ec(m) = 0.0_dp; hprev = 0.0_dp
+            do i = 2, nx / 2
+                d  = dx * (i - 1.5_dp)
+                ex = sqrt(2.0_dp * k * d)
+                if (i == 2) then
+                    hc = sqrt(k * 0.5_dp * dx)
+                else
+                    hc = (hprev + sqrt(hprev**2 + 4.0_dp * k * dx)) / 2.0_dp
+                end if
+                hprev = hc
+                ec(m) = max(ec(m), abs(hc - ex) / ex)
+                if (abs(d - d_fix) <= 0.5_dp * dx) ec_fix(m) = abs(hc - ex) / ex
+            end do
+            write(*, '(a,f6.0,a,es9.2,a,es9.2,a)') "        dx ", dx, " cell-centred update: ", ec(m), &
+                " (", ec_fix(m), " near 8 km)"
+            deallocate(z_b, tb, Hs, Hf, mask, mf)
         end do
-        write(*, '(a,4f6.2)') "        cell-centred order at 8 km: ", (log(ec_fix(m) / ec_fix(m + 1)) / log(2.0_dp), m = 1, 4)
-        call check(maxval(es) < 1.0e-12_dp, "surface reproduces Nye exactly (1-D, all dx)")
-        call check(maxval(ef) < 1.0e-12_dp, "flat reproduces Nye exactly (1-D, all dx)")
-        call check(abs(ec(5) - (1.0_dp - sqrt(0.5_dp))) < 1.0e-12_dp, &
+        call check(emax < 1.0e-12_dp, "surface and flat reproduce Nye exactly for any margin position")
+        call check(abs(ec(3) - (1.0_dp - sqrt(0.5_dp))) < 1.0e-12_dp, &
                    "cell-centred variant: first cell sqrt(1/2) low at every dx")
     end subroutine test_nye_strip
 
-    ! (i) circular cap, land margin: H = sqrt(2 k (R - r)); surface == flat on a flat bed,
-    ! and both converge (staircase margin, divide kink).
+    ! (i) circular cap of radius R off the grid, H = sqrt(2 k (R - r)): margin at the
+    ! ice-free cell centre, at the face, and from the signed distance (margin_frac from
+    ! plastic_margin_frac_from_sdist). Volume error against the exact H on the same cells
+    ! (the solver error, not the quadrature of the cap).
     subroutine test_nye_disc()
         real(dp), parameter :: R = 30000.0_dp, k = 1.0e5_dp / rho_g
-        real(dp) :: dxs(4), es(4), ef(4), dsf(4), dx, rr, ex, x0
-        real(dp), allocatable :: z_b(:,:), tb(:,:), Hs(:,:), Hf(:,:)
+        real(dp) :: dxs(4), ev(3, 4), em(3, 4), dx, rr, x0, vex, dfl
+        real(dp), allocatable :: z_b(:,:), tb(:,:), Hs(:,:), Hf(:,:), He(:,:), sd(:,:), mf(:,:)
         logical,  allocatable :: mask(:,:), inner(:,:)
-        integer  :: m, n, i, j, ns
+        integer  :: m, n, i, j, c
 
-        write(*, '(a)') "(i) Nye profile, circular cap: mean abs err over r < R/2 [m]"
-        dxs = [2000.0_dp, 1000.0_dp, 500.0_dp, 250.0_dp]
+        write(*, '(a)') "(i) circular cap: volume rel err and mean abs err over r < R/2 [m]; centre / face / sdist"
+        dxs = [4000.0_dp, 2000.0_dp, 1000.0_dp, 500.0_dp]
+        dfl = 0.0_dp
         do m = 1, 4
             dx = dxs(m)
             n = 2 * nint(R / dx) + 6
-            x0 = 0.5_dp * (n + 1) * dx
-            allocate(z_b(n, n), tb(n, n), Hs(n, n), Hf(n, n), mask(n, n), inner(n, n))
+            x0 = 0.5_dp * (n + 1) * dx + 0.37_dp * dx          ! centre off the grid
+            allocate(z_b(n, n), tb(n, n), Hs(n, n), Hf(n, n), He(n, n), sd(n, n), mf(n, n), mask(n, n), inner(n, n))
             z_b = 0.0_dp; tb = 1.0e5_dp
             do j = 1, n
                 do i = 1, n
                     rr = hypot(i * dx - x0, j * dx - x0)
+                    sd(i, j)    = R - rr
                     mask(i, j)  = rr < R
                     inner(i, j) = rr < 0.5_dp * R
+                    He(i, j)    = 0.0_dp
+                    if (mask(i, j)) He(i, j) = sqrt(2.0_dp * k * (R - rr))
                 end do
             end do
-            call solve_mode("surface", n, n, dx, z_b, tb, mask, Hs, ns)
-            call solve_mode("flat",    n, n, dx, z_b, tb, mask, Hf)
-            es(m) = 0.0_dp; ef(m) = 0.0_dp
-            do j = 1, n
-                do i = 1, n
-                    if (.not. inner(i, j)) cycle
-                    ex = sqrt(2.0_dp * k * (R - hypot(i * dx - x0, j * dx - x0)))
-                    es(m) = es(m) + abs(Hs(i, j) - ex)
-                    ef(m) = ef(m) + abs(Hf(i, j) - ex)
-                end do
+            vex = sum(He)
+            call plastic_margin_frac_from_sdist(sd, mask, dx, dx, mf)
+            do c = 1, 3
+                select case (c)
+                case (1); call solve_mode("surface", n, n, dx, z_b, tb, mask, Hs, margin="centre")
+                case (2); call solve_mode("surface", n, n, dx, z_b, tb, mask, Hs, margin="face")
+                case (3)
+                    call solve_mode("surface", n, n, dx, z_b, tb, mask, Hs, margin_frac=mf)
+                    call solve_mode("flat",    n, n, dx, z_b, tb, mask, Hf, margin_frac=mf)
+                    dfl = max(dfl, maxval(abs(Hs - Hf)))
+                end select
+                ev(c, m) = sum(Hs) / vex - 1.0_dp
+                em(c, m) = sum(abs(Hs - He), mask=inner) / count(inner)
             end do
-            es(m) = es(m) / count(inner); ef(m) = ef(m) / count(inner)
-            dsf(m) = maxval(abs(Hs - Hf))
-            write(*, '(a,f7.0,a,f8.3,a,f8.3,a,es9.2,a,i0)') "        dx ", dx, ": surface ", es(m), ", flat ", &
-                ef(m), ", max|H_surface - H_flat| ", dsf(m), " m, sweeps ", ns
-            deallocate(z_b, tb, Hs, Hf, mask, inner)
+            write(*, '(a,f6.0,a,3f8.4,a,3f7.2)') "        dx ", dx, ": volume rel err ", ev(:, m), &
+                "; mean abs err ", em(:, m)
+            deallocate(z_b, tb, Hs, Hf, He, sd, mf, mask, inner)
         end do
-        write(*, '(a,3f6.2)') "        order (surface): ", (log(es(m) / es(m + 1)) / log(2.0_dp), m = 1, 3)
-        call check(maxval(dsf) < 1.0e-9_dp, "surface == flat on a flat bed (2-D)")
-        call check(es(4) < es(3) .and. es(3) < es(2) .and. es(2) < es(1), "error decreases with dx")
+        write(*, '(a,3f6.2,a,3f6.2)') "        volume error order: centre ", &
+            (log(abs(ev(1, m) / ev(1, m + 1))) / log(2.0_dp), m = 1, 3), "; sdist ", &
+            (log(abs(ev(3, m) / ev(3, m + 1))) / log(2.0_dp), m = 1, 3)
+        call check(dfl < 1.0e-9_dp, "surface == flat with margin_frac on a flat bed")
+        call check(all(abs(ev(3, :)) < abs(ev(2, :))) .and. all(abs(ev(2, :)) < abs(ev(1, :))), &
+                   "volume error: sdist < face < centre at every dx")
+        call check(abs(ev(3, 4)) < abs(ev(3, 1)) .and. abs(ev(1, 4)) < abs(ev(1, 1)), "volume error decreases with dx")
     end subroutine test_nye_disc
 
-    ! (ii) 1-D sloped bed z_b = s x rising inland from a land margin at x = 0 (divide at
-    ! the far edge): reference from the ODE dw/dx = 2k - 2 s sqrt(w), w = H^2.
+    ! (ii) 1-D sloped bed z_b = s x rising inland from a land margin (divide at the far
+    ! edge), margin at the face x = dx/2: reference from the ODE dw/dx = 2k - 2 s sqrt(w),
+    ! w = H^2, which depends on the distance x - dx/2 from the margin only.
     subroutine test_sloped_bed()
         real(dp), parameter :: L = 100000.0_dp, s = 0.005_dp, k = 1.0e5_dp / rho_g, hstep = 0.25_dp
         real(dp) :: dxs(4), es(4), eh(4), ef(4), dx, x, ref, w0, k1, k2, k3, k4
@@ -226,7 +266,7 @@ contains
             call solve_mode("flat",    nx, 3, dx, z_b, tb, mask, Hf)
             es(m) = 0.0_dp; eh(m) = 0.0_dp; ef(m) = 0.0_dp
             do i = 2, nx
-                x = dx * (i - 1)
+                x = dx * (i - 1.5_dp)
                 if (x < 5000.0_dp) cycle
                 ref = sqrt(wref(nint(x / hstep)))
                 es(m) = max(es(m), abs(Hs(i, 2) - ref))

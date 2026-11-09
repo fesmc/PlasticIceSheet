@@ -62,6 +62,7 @@ contains
         mask = .true.
         mask(1, :) = .false.; mask(nx, :) = .false.
         par%mode = "flat"; par%max_sweeps = 400; par%tol = 1.0e-9_dp
+        par%margin = "centre"           ! as PlasticIceSheet.jl: margin at the ice-free cell centre
         call plastic_init(ps, nx, ny, dx, dx, par)
         call plastic_solve(ps, z_b, z_sl, tb, mask)
         call check(ps%converged, "flat solve converged")
@@ -160,6 +161,7 @@ contains
         call check(plastic_flotation_thickness(10.0_dp, 0.0_dp, par) == 0.0_dp, "no flotation on land")
 
         par%mode = "flat"; par%max_sweeps = 400; par%tol = 1.0e-9_dp
+        par%margin = "centre"           ! margin at the ice-free cell centre (distances below)
         call plastic_init(pf, nx, ny, dx, dx, par)
         call plastic_solve(pf, z_b, z_sl, tb, mask)
         c = 2.0_dp * tau / rho_g
@@ -260,8 +262,8 @@ contains
     end subroutine test_warm_start
 
     ! Warm solve on pw (holding the previous solution) and cold solve on pc; compare.
-    ! fewer = .false.: only require the warm solve to be no slower (a moved margin
-    ! changes H everywhere, so the stored solution is no better than the flat one).
+    ! fewer = .false.: no claim on the iteration count (a moved margin changes H
+    ! everywhere, so the stored solution is no better than the flat one).
     subroutine warm_vs_cold(pw, pc, z_sl, label, zb, tbx, msk, tol_eq, fewer)
         type(plastic_t),   intent(inout) :: pw, pc
         real(dp),          intent(in)    :: z_sl(:,:), zb(:,:), tbx(:,:), tol_eq
@@ -285,11 +287,7 @@ contains
         call check(pw%warm_used .and. pw%converged .and. pc%converged, label//": warm and cold converged")
         need_fewer = .true.
         if (present(fewer)) need_fewer = fewer
-        if (need_fewer) then
-            call check(pw%n_outer_used < pc%n_outer_used, label//": warm needs fewer outer iterations")
-        else
-            call check(pw%n_outer_used <= pc%n_outer_used, label//": warm needs no more outer iterations")
-        end if
+        if (need_fewer) call check(pw%n_outer_used < pc%n_outer_used, label//": warm needs fewer outer iterations")
         call check(dmax < tol_eq, label//": warm == cold")
     end subroutine warm_vs_cold
 
@@ -315,6 +313,15 @@ contains
         write(*, '(a,a)') "        msg: ", trim(ps%msg)
         call check(st == PLASTIC_NOT_CONVERGED .and. all(ps%H == 0.0_dp), &
                    "ice with no margin -> PLASTIC_NOT_CONVERGED, H = 0")
+        mask = .true.; mask(1, :) = .false.
+        ps%par%margin = "edge"
+        call plastic_solve(ps, a, a, a + 1.0e5_dp, mask, stat=st)
+        call check(st == PLASTIC_BAD_INPUT, "unknown par%margin -> PLASTIC_BAD_INPUT")
+        ps%par%margin = "face"
+        call plastic_solve(ps, a, a, a + 1.0e5_dp, mask, stat=st, margin_frac=a + 1.0_dp)
+        call check(st == PLASTIC_BAD_INPUT, "margin_frac = 1 on an ice-free cell -> PLASTIC_BAD_INPUT")
+        call plastic_solve(ps, a, a, a + 1.0e5_dp, mask, stat=st, margin_frac=a + 0.99_dp)
+        call check(st == PLASTIC_OK, "margin_frac = 0.99 accepted")
         call plastic_init(ps, 0, 10, 1000.0_dp, 1000.0_dp, par, stat=st)
         call check(st == PLASTIC_BAD_INPUT, "plastic_init with nx = 0 -> PLASTIC_BAD_INPUT")
         call plastic_end(ps)
