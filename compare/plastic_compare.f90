@@ -84,8 +84,9 @@ contains
         slide%law = trim(law)
         write(*, '(a,": ",i0," x ",i0,", dx = ",f0.0," m, ice cells ",i0)') name, nx, ny, dx, count(mask)
 
-        ! flat
+        ! flat (margin at the ice-free cell centre, as PlasticIceSheet.jl)
         par%mode = "flat"
+        par%margin = "centre"
         call plastic_init(ps, nx, ny, dx, dy, par)
         t_flat = huge(1.0_dp)
         do rep = 1, 3
@@ -164,7 +165,7 @@ contains
         H_smb = -1.0_dp
         if (do_smb == 1) then
             ctrl%mode = "flat"          ! as PlasticIceSheet.jl
-            call plastic_init(ps, nx, ny, dx, dy)
+            call plastic_init(ps, nx, ny, dx, dy, par)
             t0 = wall_time()
             call plastic_solve_smb(ps, z_bed, z_sl, smb, mask, rheo, slide, ctrl=ctrl)
             t_smb = wall_time() - t0
@@ -178,7 +179,7 @@ contains
             call plastic_solve_smb(ps, z_bed, z_sl, smb1, mask, rheo, slide, warm=.true., ctrl=ctrl)
             tsw = wall_time() - t0
             nsw = ps%n_outer_used
-            call plastic_init(pc, nx, ny, dx, dy)
+            call plastic_init(pc, nx, ny, dx, dy, par)
             t0 = wall_time()
             call plastic_solve_smb(pc, z_bed, z_sl, smb1, mask, rheo, slide, ctrl=ctrl)
             tsc = wall_time() - t0

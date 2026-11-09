@@ -112,6 +112,8 @@ compare: $(objdir)/libplastic.a
 		-L$(objdir) -lplastic $(LIB_FESMUTILS) $(LIB_NC) $(LFLAGS)
 	$(FC) $(DFLAGS) $(FFLAGS) $(INC_FESMUTILS) -o $(bindir)/smb_sia_proto.x compare/smb_sia_proto.f90 \
 		-L$(objdir) -lplastic $(LIB_FESMUTILS) $(LIB_NC) $(LFLAGS)
+	$(FC) $(DFLAGS) $(FFLAGS) -o $(bindir)/plastic_native.x compare/native/plastic_native.f90 \
+		-L$(objdir) -lplastic $(LFLAGS)
 
 clean:
 	rm -f $(objdir)/*.o $(objdir)/*.mod $(objdir)/*.a $(objdir)/*.smod $(bindir)/*.x
