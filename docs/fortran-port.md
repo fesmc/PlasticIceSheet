@@ -15,14 +15,14 @@ for kryos (see [Mode "surface"](#mode-surface)).
 ```fortran
 type(plastic_par_t)  :: par   ! rho_i=917, rho_w=1025, g=9.80665, H_min=1, mode="full"|"flat"|"surface",
                               ! max_sweeps=200, n_outer=100, tol=1e-6, outer_tol=1e-3, relax=0.5,
-                              ! warm_frac_max=0.1
+                              ! warm_frac_max=0.1, margin="face"|"centre"
 type(plastic_t)      :: ps    ! par, nx, ny, dx, dy, w=H^2, H, z_srf, n_outer_used, converged,
                               ! stat, msg, n_sweeps, outer_change, warm_used, n_new_cells
 
 call plastic_init(ps, nx, ny, dx, dy [, par, stat])
-call plastic_solve(ps, z_bed, z_sl, tau_b, mask [, warm, stat])
-call plastic_residual(ps, z_bed, z_sl, tau_b, mask, r [, stat])  ! Godunov residual (w, or z_s in "surface")
-call plastic_stress_residual(ps, z_bed, z_sl, tau_b, mask, rmax [, r, stat])
+call plastic_solve(ps, z_bed, z_sl, tau_b, mask [, warm, stat, margin_frac])
+call plastic_residual(ps, z_bed, z_sl, tau_b, mask, r [, stat, margin_frac])  ! Godunov residual (w, or z_s in "surface")
+call plastic_stress_residual(ps, z_bed, z_sl, tau_b, mask, rmax [, r, stat, margin_frac])
                               ! | |grad z_s| rho_i g H - tau_b | / tau_b, upwind gradient, any mode
 call plastic_reset(ps)                                            ! drop the warm start
 call plastic_end(ps)
@@ -41,7 +41,8 @@ call plastic_balance_flux(z_srf, mask, smb, dx, dy, Q [, stat])
 call plastic_balance_velocity(z_srf, H, mask, smb, dx, dy, speed, ux, uy [, Q, slope_eps, H_min, stat])
 call plastic_implied_basal_velocity(z_srf, H, tau_b, mask, smb, dx, dy, rheo, u_basal &
                                     [, u_balance, u_def, Q, slope_eps, H_min, stat])
-call plastic_solve_smb(ps, z_bed, z_sl, smb, mask, rheo, slide [, warm, ctrl, H_init, tau_d, stat])
+call plastic_solve_smb(ps, z_bed, z_sl, smb, mask, rheo, slide [, warm, ctrl, H_init, tau_d, stat, margin_frac])
+call plastic_margin_frac_from_sdist(sdist, mask, dx, dy, frac)  ! margin_frac from a signed distance
 u = plastic_basal_velocity(slide, tau_b); u = plastic_deformational_velocity(rheo, tau, H)
 ```
 
@@ -86,6 +87,76 @@ Warm and cold solves both stop on an outer step `max|dH| < outer_tol`; with the 
 rate rho ~ 0.7 of the damped map each is within ~rho/(1-rho) outer_tol of the fixed
 point, so they agree to a few `outer_tol` (and converge to the same fixed point as
 `outer_tol -> 0`, see the tests).
+
+## Margin position
+
+The margin lies between an ice cell and an ice-free neighbour. `margin_frac(nx,ny)`
+(optional, on the ice-free cells next to the ice) is the distance from the ice-free cell
+centre to the margin as a fraction of the spacing, in [0, 1): the neighbour enters the
+Godunov update at (1 - margin_frac) dx (dy), with its margin value (z_b + H_flt, or
+H_flt^2). The factor is floored at `MARGIN_DMIN` = 0.01, so a margin closer than 1 % of a
+cell to an ice-cell centre counts as at 1 %. Values outside [0, 1) on ice-free cells give
+`PLASTIC_BAD_INPUT`. Without `margin_frac`, `par%margin` sets one value: `"face"`
+(default, 0.5: margin at the cell face) or `"centre"` (0: at the ice-free cell centre,
+as PlasticIceSheet.jl). The rule applies to all modes and to `plastic_solve_smb`, and to
+the residual diagnostics.
+
+Signed-distance convention (kryos): `sdist(nx,ny)` [m] is the distance to the margin,
+positive in the ice and negative outside, at the cell centres.
+`plastic_margin_frac_from_sdist(sdist, mask, dx, dy, frac)` returns
+frac = -sdist / h, h = sqrt(dx dy), clamped to [0, 1 - MARGIN_DMIN], on ice-free cells
+with an ice neighbour, 0 elsewhere. The per-cell value is isotropic: exact for margins
+along a grid axis; for an oblique margin the exact axis distance would need the pair of
+sdist values across each face (not implemented).
+
+With unequal spacings on the two sides of an axis, the upwind term is the Godunov
+max_s (u - a_s)+/d_s over the sides, so the update is the minimum over the side
+combinations (up to four kernel calls, only at margin cells). Every candidate is monotone
+in the neighbour values, hence so is the minimum: the flat (w-eikonal) and surface
+schemes stay monotone. With equal spacings the update is the previous one: `"centre"`
+is bit-identical to PlasticIceSheet.jl (comparison rerun), and the margin handling costs
+~5 % (300 x 300: flat 5.6/6.1 ms, surface 8.9/9.2 ms, centre/face).
+
+Tests (`tests/test_surface.f90`):
+
+- 1-D Nye strip, land margins at f = 0, 0.5, (0.3, 0.77), (0.95, 0.05) of the end cells,
+  dx = 4 km to 250 m: surface and flat equal sqrt(2 k d) to < 2e-13 (relative) for every f,
+  with d the distance to the margin: no half-cell offset.
+- Circular cap, R = 30 km, centre off the grid; volume relative error of the solution
+  (against the exact H on the same cells):
+
+| dx | centre | face | sdist |
+|---|---|---|---|
+| 4 km | +10.1 % | -0.83 % | -0.54 % |
+| 2 km | +4.2 % | -1.9 % | -0.27 % |
+| 1 km | +2.3 % | -0.96 % | -0.12 % |
+| 500 m | +1.1 % | -0.56 % | -0.07 % |
+
+  first order for centre and sdist; face has the opposite sign (a staircase margin is on
+  average not at the face). Surface == flat with margin_frac on the flat bed.
+
+### Native-grid check against ICESHEET
+
+`compare/native` (copies of the drivers in `/work/ba1442/robinson/plastic-diag`):
+ICESHEET (PaleoMIST 1.0) 5 km North America output, PlasticIceSheet `"surface"` on the
+same bed, tau_b and mask, inputs block-averaged to 10-30 km (ice where >= half the block).
+Volume ratio PlasticIceSheet / ICESHEET over the largest ice body; sdist = signed distance
+to the 5 km ICESHEET margin at the coarse cell centres.
+
+| dx | Greenland 0 ka: centre | face | sdist | NA 20 ka: centre | face | sdist |
+|---|---|---|---|---|---|---|
+| 5 km | 1.017 | 1.009 | 1.009 | 1.007 | 1.005 | 1.005 |
+| 10 km | 1.063 | 1.047 | 1.050 | 1.029 | 1.025 | 1.025 |
+| 20 km | 1.089 | 1.055 | 1.072 | 1.060 | 1.051 | 1.053 |
+| 30 km | 1.113 | 1.060 | 1.087 | 1.082 | 1.070 | 1.073 |
+
+The margin position accounts for 0.4-5 points of the excess at 10-30 km (centre to sdist or face). The rest is not the metric
+(the ratio against the 5 km thickness sampled at the coarse centres is within 0.002 of
+the block-mean ratio) but the coarse inputs and the first-order scheme: solving at 5 km
+with the bed, mask and tau_b block-averaged to 30 km already gives 1.039 (0 ka) and 1.029
+(20 ka) (plastic-diag variants). "face" beats "sdist" at 20-30 km on Greenland because the
+coarse mask (>= 50 % of the block) leaves partly iced cells outside it, and moving the
+margin inward offsets part of the other errors; sdist is the more faithful margin.
 
 ## Mode "surface"
 
@@ -238,7 +309,8 @@ case from Julia (`compare/julia_ref.jl`), runs PlasticIceSheet.jl (1.12.6, after
 warm-up) and the Fortran driver (`compare/plastic_compare.f90`, ifx 2023.2, `-O3
 -march=core-avx2 -fp-model precise`) on them, and tabulates the differences over the ice
 mask (`compare/compare.jl`). Times are wall clock, best of 3 for flat/full, one run for
-the SMB-driven solve.
+the SMB-driven solve. All Fortran runs of the comparison use `par%margin = "centre"`
+(Julia's margin position), including the surface-mode results below.
 
 - `synth150`, `synth300`: synthetic cap (dx = 2 km, circular mask, 300 m bedrock high plus
   50 m undulations, tau_b = 1e5 Pa +- 30 %); full with relax = 0.4, n_outer = 200;
