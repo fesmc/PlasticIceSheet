@@ -43,6 +43,10 @@ module plastic_eikonal
         ! "face" (half way, margin_frac = 0.5) or "centre" (at the ice-free cell centre,
         ! margin_frac = 0, as PlasticIceSheet.jl).
         character(len=8) :: margin = "face"
+        ! Sweep ordering: "serial" (row by row) or "wavefront" (the cells of each
+        ! anti-diagonal in parallel with OpenMP; the same Gauss-Seidel dependencies, hence
+        ! bit-identical results for any thread count).
+        character(len=10) :: sweep = "serial"
         ! Warm start: fall back to a cold start when more than this fraction of the
         ! ice cells is new to the mask (see plastic_solve).
         real(dp) :: warm_frac_max = 0.1_dp
@@ -311,13 +315,62 @@ contains
         end do
     end function sweep_once
 
+    ! sweep_once in wavefront order: the anti-diagonals p + q = const of the sweep
+    ! ordering, one after the other, the cells of a diagonal in parallel. A cell reads its
+    ! four neighbours: (p-1,q), (p,q-1) on the previous diagonal (updated) and (p+1,q),
+    ! (p,q+1) on the next (not yet), exactly as in the row-by-row sweep.
+    function sweep_once_wavefront(kind, nx, ny, u, F, zb, mask, dfac, dx, dy, xdir, ydir) result(change)
+        integer,  intent(in)    :: kind, nx, ny
+        real(dp), intent(inout) :: u(nx, ny)
+        real(dp), intent(in)    :: F(nx, ny), zb(nx, ny), dfac(nx, ny)
+        logical,  intent(in)    :: mask(nx, ny)
+        real(dp), intent(in)    :: dx, dy
+        integer,  intent(in)    :: xdir, ydir
+        real(dp) :: change
+        integer  :: d, p, q, i, j, i0, j0, im, ip, jm, jp
+        real(dp) :: unew, a, b
+
+        i0 = 1; if (xdir < 0) i0 = nx
+        j0 = 1; if (ydir < 0) j0 = ny
+        change = 0.0_dp
+        !$omp parallel private(d, p, q, i, j, im, ip, jm, jp, unew, a, b) reduction(max:change)
+        do d = 2, nx + ny
+            !$omp do schedule(static)
+            do q = max(1, d - nx), min(ny, d - 1)
+                p = d - q
+                i = i0 + (p - 1) * xdir
+                j = j0 + (q - 1) * ydir
+                if (.not. mask(i, j)) cycle
+                im = max(i - 1, 1); ip = min(i + 1, nx)
+                jm = max(j - 1, 1); jp = min(j + 1, ny)
+                if (dfac(im, j) == dfac(ip, j) .and. dfac(i, jm) == dfac(i, jp)) then
+                    a = min(u(im, j), u(ip, j))
+                    b = min(u(i, jm), u(i, jp))
+                    if (kind == KERNEL_EIKONAL) then
+                        unew = godunov_eikonal(a, dx * dfac(im, j), b, dy * dfac(i, jm), F(i, j))
+                    else
+                        unew = godunov_surface(a, dx * dfac(im, j), b, dy * dfac(i, jm), zb(i, j), F(i, j))
+                    end if
+                else
+                    unew = update_at(kind, nx, ny, i, j, u, F(i, j), zb(i, j), dfac, dx, dy)
+                end if
+                if (unew < u(i, j)) then
+                    change  = max(change, u(i, j) - unew)
+                    u(i, j) = unew
+                end if
+            end do
+            !$omp end do
+        end do
+        !$omp end parallel
+    end function sweep_once_wavefront
+
     ! Solve |grad u| = F on the ice cells (mask), with Dirichlet values bc on the
     ! ice-free cells, placed at d dfac from the neighbouring ice-cell centres. u starts
     ! from BIG on ice cells (the monotone scheme only decreases u). The four diagonal
     ! orderings alternate; the early exit needs a full cycle of four. Returns the number
     ! of sweeps and whether tol was reached. With zb present, solves the surface
     ! equation instead (u = z_s, F = tau_b/(rho_i g), see godunov_surface).
-    subroutine sweep_eikonal(nx, ny, u, F, mask, bc, dfac, dx, dy, max_sweeps, tol, n_sweeps, ok, zb)
+    subroutine sweep_eikonal(nx, ny, u, F, mask, bc, dfac, dx, dy, max_sweeps, tol, n_sweeps, ok, zb, wavefront)
         integer,  intent(in)  :: nx, ny
         real(dp), intent(out) :: u(nx, ny)
         real(dp), intent(in)  :: F(nx, ny), bc(nx, ny), dfac(nx, ny)
@@ -327,10 +380,12 @@ contains
         integer,  intent(out) :: n_sweeps
         logical,  intent(out) :: ok
         real(dp), optional, intent(in) :: zb(nx, ny)
+        logical,  optional, intent(in) :: wavefront
         integer, parameter :: xd(4) = [1, -1, -1, 1]
         integer, parameter :: yd(4) = [1, 1, -1, -1]
-        integer  :: i, j, s, k
+        integer  :: i, j, s, k, kind
         real(dp) :: change
+        logical  :: wave
 
         do j = 1, ny
             do i = 1, nx
@@ -342,14 +397,22 @@ contains
             end do
         end do
 
+        kind = KERNEL_EIKONAL
+        if (present(zb)) kind = KERNEL_SURFACE
+        wave = .false.
+        if (present(wavefront)) wave = wavefront
         ok = .false.
         n_sweeps = 0
         do s = 1, max_sweeps
             k = mod(s - 1, 4) + 1
-            if (present(zb)) then
-                change = sweep_once(KERNEL_SURFACE, nx, ny, u, F, zb, mask, dfac, dx, dy, xd(k), yd(k))
+            if (wave .and. kind == KERNEL_SURFACE) then
+                change = sweep_once_wavefront(kind, nx, ny, u, F, zb, mask, dfac, dx, dy, xd(k), yd(k))
+            else if (wave) then
+                change = sweep_once_wavefront(kind, nx, ny, u, F, F, mask, dfac, dx, dy, xd(k), yd(k))
+            else if (kind == KERNEL_SURFACE) then
+                change = sweep_once(kind, nx, ny, u, F, zb, mask, dfac, dx, dy, xd(k), yd(k))
             else
-                change = sweep_once(KERNEL_EIKONAL, nx, ny, u, F, F, mask, dfac, dx, dy, xd(k), yd(k))
+                change = sweep_once(kind, nx, ny, u, F, F, mask, dfac, dx, dy, xd(k), yd(k))
             end if
             n_sweeps = s
             if (s >= 4 .and. change < tol) then

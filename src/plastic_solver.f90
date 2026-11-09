@@ -214,7 +214,7 @@ contains
 
         if (.not. full) then
             call sweep_eikonal(nx, ny, ps%w, ps%wk%G, mask, ps%wk%bc, ps%wk%dfac, ps%dx, ps%dy, &
-                               ps%par%max_sweeps, ps%par%tol, ns, ok)
+                               ps%par%max_sweeps, ps%par%tol, ns, ok, wavefront=wave_on(ps))
             ps%n_sweeps = ns
             ps%converged = ok
             if (.not. ok) ps%msg = "plastic_solve: inner sweep reached max_sweeps"
@@ -252,7 +252,7 @@ contains
                 call rhs_full(nx, ny, ps%w, ps%wk%G, ps%wk%zbx, ps%wk%zby, ps%dx, ps%dy, &
                               ps%par%H_min, ps%wk%F)
                 call sweep_eikonal(nx, ny, ps%wk%wc, ps%wk%F, mask, ps%wk%bc, ps%wk%dfac, ps%dx, ps%dy, &
-                                   ps%par%max_sweeps, ps%par%tol, ns, ok)
+                                   ps%par%max_sweeps, ps%par%tol, ns, ok, wavefront=wave_on(ps))
                 ps%n_sweeps = ps%n_sweeps + ns
                 inner_ok = inner_ok .and. ok
                 conv = 0.0_dp
@@ -302,7 +302,7 @@ contains
 
         call surface_bc(ps, z_bed, z_sl, tau_b)
         call sweep_eikonal(nx, ny, ps%wk%wc, ps%wk%G, mask, ps%wk%bc, ps%wk%dfac, ps%dx, ps%dy, &
-                           ps%par%max_sweeps, ps%par%tol, ns, ok, zb=z_bed)
+                           ps%par%max_sweeps, ps%par%tol, ns, ok, zb=z_bed, wavefront=wave_on(ps))
         ps%n_sweeps  = ns
         ps%converged = ok
         if (.not. ok) ps%msg = "plastic_solve: surface sweep reached max_sweeps"
@@ -375,7 +375,7 @@ contains
         logical :: ok1
 
         call sweep_eikonal(ps%nx, ps%ny, u, ps%wk%G, mask, ps%wk%bc, ps%wk%dfac, ps%dx, ps%dy, &
-                           ps%par%max_sweeps, ps%par%tol, ns, ok1)
+                           ps%par%max_sweeps, ps%par%tol, ns, ok1, wavefront=wave_on(ps))
         ps%n_sweeps = ps%n_sweeps + ns
         ok = ok .and. ok1
     end subroutine cold_flat_solve
@@ -454,6 +454,11 @@ contains
             trim(ps%par%mode) /= "surface") then
             ps%stat = PLASTIC_BAD_INPUT
             ps%msg  = "plastic: par%mode must be ""full"", ""flat"" or ""surface"""
+            return
+        end if
+        if (trim(ps%par%sweep) /= "serial" .and. trim(ps%par%sweep) /= "wavefront") then
+            ps%stat = PLASTIC_BAD_INPUT
+            ps%msg  = 'plastic: par%sweep must be "serial" or "wavefront"'
             return
         end if
         call check_shape(ps, size(z_bed, 1), size(z_bed, 2), "z_bed")
@@ -619,6 +624,11 @@ contains
             end do
         end do
     end subroutine plastic_stress_residual
+
+    pure logical function wave_on(ps)
+        type(plastic_t), intent(in) :: ps
+        wave_on = (trim(ps%par%sweep) == "wavefront")
+    end function wave_on
 
     ! Spacing factor ps%wk%dfac to each cell as a neighbour: 1 on ice cells; on ice-free
     ! cells max(1 - f, MARGIN_DMIN), f = margin_frac if given, else 0.5 (par%margin =

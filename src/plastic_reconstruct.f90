@@ -386,11 +386,13 @@ contains
             if (surf) then
                 ps%wk%G = tau / rg
                 call sweep_eikonal(nx, ny, u, ps%wk%G, mask, ps%wk%bc, ps%wk%dfac, ps%dx, ps%dy, &
-                                   c%max_sweeps, c%sweep_tol, ns0, ok0, zb=z_bed)
+                                   c%max_sweeps, c%sweep_tol, ns0, ok0, zb=z_bed, &
+                                   wavefront=(trim(ps%par%sweep) == "wavefront"))
             else
                 ps%wk%G = 2.0_dp * tau / rg
                 call sweep_eikonal(nx, ny, u, ps%wk%G, mask, ps%wk%bc, ps%wk%dfac, ps%dx, ps%dy, &
-                                   c%max_sweeps, c%sweep_tol, ns0, ok0)
+                                   c%max_sweeps, c%sweep_tol, ns0, ok0, &
+                                   wavefront=(trim(ps%par%sweep) == "wavefront"))
             end if
             ps%n_sweeps = ps%n_sweeps + ns0
             inner_ok = inner_ok .and. ok0

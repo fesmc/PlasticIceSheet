@@ -20,6 +20,7 @@ program test_surface
     call test_nye_disc()
     call test_sloped_bed()
     call test_bump()
+    call test_wavefront()
     call finish("test_surface")
 
 contains
@@ -322,5 +323,50 @@ contains
         call check(dsh(3) < dsh(2) .and. dsh(2) < dsh(1), "surface - full shrinks with dx")
         call check(dsh(3) < 0.2_dp * dfh(3), "surface - full << flat - full (bed effect)")
     end subroutine test_bump
+
+    ! The wavefront sweep (cells of an anti-diagonal in parallel) has the Gauss-Seidel
+    ! dependencies of the row sweep: identical bits in every mode, with a sub-cell margin.
+    subroutine test_wavefront()
+        integer, parameter :: n = 90
+        real(dp), parameter :: dx = 2000.0_dp
+        type(plastic_t)     :: ps
+        type(plastic_par_t) :: par
+        real(dp) :: z_b(n, n), z_sl(n, n), tb(n, n), sd(n, n), mf(n, n), H1(n, n), x, y
+        logical  :: mask(n, n), same
+        integer  :: i, j, m
+        character(len=8) :: modes(3) = [character(len=8) :: "surface", "flat", "full"]
+
+        write(*, '(a)') "wavefront sweep == serial sweep"
+        do j = 1, n
+            do i = 1, n
+                x = (i - 0.5_dp) * dx - 0.5_dp * n * dx
+                y = (j - 0.5_dp) * dx - 0.5_dp * n * dx
+                z_b(i, j)  = 300.0_dp * exp(-(x * x + y * y) / (2.0_dp * 2.5e4_dp**2)) + 50.0_dp * sin(i / 7.0_dp)
+                tb(i, j)   = 1.0e5_dp * (1.0_dp + 0.3_dp * cos(j / 9.0_dp))
+                sd(i, j)   = 0.37_dp * n * dx - hypot(x + 3000.0_dp, y - 1700.0_dp)
+                mask(i, j) = sd(i, j) > 0.0_dp
+            end do
+        end do
+        z_sl = 0.0_dp
+        call plastic_margin_frac_from_sdist(sd, mask, dx, dx, mf)
+        same = .true.
+        do m = 1, 3
+            par%mode = modes(m); par%relax = 0.4_dp
+            par%sweep = "serial"
+            call plastic_init(ps, n, n, dx, dx, par)
+            call plastic_solve(ps, z_b, z_sl, tb, mask, margin_frac=mf)
+            H1 = ps%H
+            ps%par%sweep = "wavefront"
+            call plastic_solve(ps, z_b, z_sl, tb, mask, margin_frac=mf)
+            same = same .and. all(ps%H == H1)
+            call plastic_end(ps)
+        end do
+        call check(same, "wavefront sweep bit-identical to the serial sweep (surface, flat, full)")
+        par%sweep = "diagonal"
+        call plastic_init(ps, n, n, dx, dx, par)
+        call plastic_solve(ps, z_b, z_sl, tb, mask, stat=i)
+        call check(i == PLASTIC_BAD_INPUT, "unknown par%sweep -> PLASTIC_BAD_INPUT")
+        call plastic_end(ps)
+    end subroutine test_wavefront
 
 end program test_surface
