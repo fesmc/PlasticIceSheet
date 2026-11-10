@@ -14,11 +14,15 @@ module plastic_inversion
     !              e = x - x_law, U_law the closure's speed at the cell (u_b + u_def at tau = min(rho_i g H |grad s|,
     !              the stress cap)), sigma_a = max(sigma_smb_rel |a_prior|, sigma_smb_min), L = ctrl%smooth, d the
     !              face's spacing; cold: the ice cells without a margin face where a_prior >= 0;
-    !   bound      x >= ln U_def (the deformation speed at that stress: sliding >= 0).
+    !   soft bound + 1/2 sum (min(x - ln U_def, 0)/sigma_def)^2: the speed at least the deformation speed at that
+    !              stress (sliding >= 0) within sigma_def, the uncertainty of the rate factor.
     !
-    ! Gauss-Newton on x: each step the sparse SPD system (13-point) of the normal equations, scaled symmetrically by its
-    ! diagonal (the terms span many orders of magnitude) and solved inexactly with the library's linear solver; the bound
-    ! by projection (an active set: variables at the bound with a positive gradient are held), backtracking on J. Limits: sigma_u -> 0 gives the flow law's speed; sigma_a -> 0 the balance flux of the prior.
+    ! Gauss-Newton on x: each step the sparse SPD system (13-point) of the normal equations H dx = -g, H = Lambda + S +
+    ! B' W B (Lambda the flow-law term, S the smoothness, B = D diag(U) the linearised mass balance, W its weights). The
+    ! mass-balance part dominates by orders of magnitude, so H is solved by conjugate gradients preconditioned with the
+    ! exact inverse of B' W B: with upwind face speeds D is lower triangular when the cells are ordered by descending
+    ! surface, so B^-1 W^-1 B^-T costs two sweeps (the land outflow on the diagonal of the preconditioner's D, so every
+    ! row has one). Backtracking on J. Limits: sigma_u -> 0 gives the flow law's speed; sigma_a -> 0 the balance flux of the prior.
     ! Units: m, yr, Pa; a, a_prior, dH/dt in m ice/yr.
 
     use plastic_kinds,    only: dp
@@ -27,7 +31,7 @@ module plastic_inversion
     use plastic_flow,     only: plastic_glen_t, plastic_sliding_t, sliding_law_code, basal_velocity_code, &
                                 deformational_velocity
     use plastic_steady,   only: steady_margin_values, face_H, cslope, cap_cells, fric_cells
-    use plastic_linsolve, only: lin_reserve, lin_solve, lin_has_lis
+    use plastic_linsolve, only: lin_reserve
 
     implicit none
 
@@ -41,21 +45,21 @@ module plastic_inversion
         real(dp) :: sigma_smb_min = 0.1_dp        ! [m ice/yr] its floor
         logical  :: cold = .true.                 ! penalise a < 0 where a_prior >= 0 (ice cells without a margin face)
         real(dp) :: sigma_cold = 0.01_dp          ! [m ice/yr] the scale of that penalty
+        real(dp) :: sigma_def = 0.1_dp            ! sd of ln U below the deformation speed (the soft no-sliding bound)
         real(dp) :: u_min = 1.0e-3_dp             ! [m/yr] floor of U_law and of the bound
         integer  :: n_iter = 100                  ! Gauss-Newton steps
         real(dp) :: tol = 1.0e-6_dp               ! stop at a relative decrease of J below tol with a full step
-        character(len=8) :: lin = "auto"         ! "auto" | "lis" | "builtin"
-        real(dp) :: lin_tol = 1.0e-6_dp           ! relative residual of the (diagonally scaled) step system
-        integer  :: lin_maxit = 2000
+        real(dp) :: lin_tol = 1.0e-6_dp           ! relative residual of the step system (conjugate gradients)
+        integer  :: lin_maxit = 500
         logical  :: verbose = .false.
     end type plastic_inv_ctrl_t
 
     type plastic_inv_info_t
         integer  :: iters = 0                     ! Gauss-Newton steps taken
         real(dp) :: J = 0.0_dp                    ! the objective at the solution, its four terms
-        real(dp) :: J_law = 0.0_dp, J_smooth = 0.0_dp, J_smb = 0.0_dp, J_cold = 0.0_dp
+        real(dp) :: J_law = 0.0_dp, J_smooth = 0.0_dp, J_smb = 0.0_dp, J_cold = 0.0_dp, J_def = 0.0_dp
         real(dp) :: J_start = 0.0_dp              ! at U = U_law (the forward closure)
-        integer  :: n_bound = 0                   ! cells at the bound (no sliding)
+        integer  :: n_bound = 0                   ! cells below the deformation speed (negative sliding)
         integer  :: n_cold_neg = 0                ! cold cells with a < 0
     end type plastic_inv_info_t
 
@@ -89,9 +93,12 @@ contains
         real(dp), allocatable :: sm(:,:), hm(:,:), sf(:,:), cm(:,:), bm(:,:)
         real(dp), allocatable :: D(:,:), cmar(:), clan(:), xlaw(:), xlo(:), x(:), xn(:), dx_(:), g(:), w(:), r(:)
         real(dp), allocatable :: ap(:), sa(:), dh(:), u(:), a(:), h(:,:), udf(:), sc(:)
-        logical,  allocatable :: cold(:), act(:)
-        real(dp) :: rg, tau, ub, ud, gx, gy, sux, suy, Jc, Jn, alpha, lsum(4), lsn(4)
-        logical  :: ok, use_lis, conv
+        logical,  allocatable :: cold(:)
+        real(dp) :: rg, tau, ub, ud, gx, gy, sux, suy, Jc, Jn, alpha, lsum(5), lsn(5), lres
+        integer  :: lit
+        integer,  allocatable :: ord(:)
+        real(dp), allocatable :: dpre(:), wk(:)
+        logical  :: ok, conv
 
         if (present(ctrl)) c = ctrl
         ps%stat = PLASTIC_OK
@@ -102,9 +109,11 @@ contains
             ps%stat = PLASTIC_BAD_INPUT
             ps%msg  = "plastic_smb_inversion: not initialized or unknown sliding law"
         else if (.not. (c%sigma_u > 0.0_dp .and. c%sigma_smb_min > 0.0_dp .and. c%sigma_smb_rel >= 0.0_dp .and. &
-                        c%sigma_cold > 0.0_dp .and. c%smooth >= 0.0_dp .and. c%u_min > 0.0_dp)) then
+                        c%sigma_cold > 0.0_dp .and. c%sigma_def > 0.0_dp .and. c%smooth >= 0.0_dp .and. &
+                        c%u_min > 0.0_dp)) then
             ps%stat = PLASTIC_BAD_INPUT
-            ps%msg  = "plastic_smb_inversion: sigma_u, sigma_smb_min, sigma_cold, u_min > 0; sigma_smb_rel, smooth >= 0"
+            ps%msg  = "plastic_smb_inversion: sigma_u, sigma_smb_min, sigma_cold, sigma_def, u_min > 0; sigma_smb_rel, "// &
+                      "smooth >= 0"
         else
             call check_shape(ps, size(z_bed, 1), size(z_bed, 2), "z_bed")
             call check_shape(ps, size(z_sl, 1), size(z_sl, 2), "z_sl")
@@ -209,8 +218,13 @@ contains
         end if
 
         ! --- Gauss-Newton -------------------------------------------------------------------------------------------
-        use_lis = trim(c%lin) == "lis" .or. (trim(c%lin) == "auto" .and. lin_has_lis())
-        allocate(x(n), xn(n), dx_(n), g(n), w(n), r(n), u(n), a(n), act(n), h(NS, n), sc(n))
+        ! the preconditioner: cells by descending surface (the upwind mass balance is lower triangular in that order),
+        ! its diagonal with the outflow to land (so every row has one; a cell without any outflow takes a small one)
+        ord = order_desc([(sf(ci(k), cj(k)), k = 1, n)])
+        dpre = D(0, :) + clan
+        where (.not. dpre > 0.0_dp) dpre = 1.0e-3_dp*max(maxval(dpre), tiny(1.0_dp))
+        allocate(wk(n))
+        allocate(x(n), xn(n), dx_(n), g(n), w(n), r(n), u(n), a(n), h(NS, n), sc(n))
         x = xlaw
         call objective(x, Jc, lsum)
         inf%J_start = Jc
@@ -246,10 +260,12 @@ contains
                     end do
                 end do
             end do
-            act = x <= xlo + 1.0e-12_dp .and. g > 0.0_dp
-            ! the system H dx = -g (held variables: identity rows and columns), scaled: (S H S) y = -S g, dx = S y,
-            ! S = diag(H)^(-1/2)
-            sc = 1.0_dp/sqrt(h(7, :))
+            where (x < xlo)
+                g = g + (x - xlo)/c%sigma_def**2
+                h(7, :) = h(7, :) + 1.0_dp/c%sigma_def**2
+            end where
+            ! the system H dx = -g, by conjugate gradients preconditioned
+            ! with the exact inverse of its mass-balance part (pcg)
             nh = 0
             ps%wk%lin%ia(1) = 1
             do k = 1, n
@@ -260,32 +276,24 @@ contains
                     if (q == 0) cycle
                     nh = nh + 1
                     ps%wk%lin%ja(nh) = q
-                    if (act(k) .or. act(q)) then
-                        ps%wk%lin%a(nh) = merge(1.0_dp, 0.0_dp, q == k)
-                    else
-                        ps%wk%lin%a(nh) = sc(k)*h(kk, k)*sc(q)
-                    end if
+                    ps%wk%lin%a(nh) = h(kk, k)
                 end do
                 ps%wk%lin%ia(k + 1) = nh + 1
-                ps%wk%lin%b(k) = merge(0.0_dp, -sc(k)*g(k), act(k))
-                ps%wk%lin%x(k) = 0.0_dp
             end do
             ps%wk%lin%n = n
             ps%wk%lin%nnz = nh
-            call lin_solve(ps%wk%lin, c%lin_tol, c%lin_maxit, use_lis, ok)
-            dx_ = sc*ps%wk%lin%x(1:n)
-            where (act) dx_ = 0.0_dp
+            sc = -g
+            call pcg(sc, dx_, ok, lit, lres)
             ! backtracking on J
             alpha = 1.0_dp
             do kk = 1, 30
-                xn = max(x + alpha*dx_, xlo)
+                xn = x + alpha*dx_
                 call objective(xn, Jn, lsn)
                 if (Jn < Jc) exit
                 alpha = 0.5_dp*alpha
             end do
             if (c%verbose) write(*, "(a,i4,a,es12.5,a,es10.3,a,i0,a,l1,a,i0,a,es9.2)") "plastic_smb_inversion: it ", it, &
-                " J ", Jn, " step ", alpha, " held ", count(act), " lin ok ", ok, " it ", ps%wk%lin%iters, " relres ", &
-                ps%wk%lin%relres
+                " J ", Jn, " step ", alpha, " below u_def ", count(xn < xlo), " cg ok ", ok, " it ", lit, " relres ", lres
             if (.not. Jn < Jc) then
                 conv = .true.
                 exit
@@ -312,8 +320,8 @@ contains
             if (present(u_def))    u_def(i, j) = udf(k)
         end do
         inf%J = Jc
-        inf%J_law = lsum(1);  inf%J_smooth = lsum(2);  inf%J_smb = lsum(3);  inf%J_cold = lsum(4)
-        inf%n_bound = count(x <= xlo + 1.0e-12_dp)
+        inf%J_law = lsum(1);  inf%J_smooth = lsum(2);  inf%J_smb = lsum(3);  inf%J_cold = lsum(4);  inf%J_def = lsum(5)
+        inf%n_bound = count(x < xlo - c%sigma_def)
         inf%n_cold_neg = count(cold .and. a < 0.0_dp)
         if (present(info)) info = inf
         if (.not. conv) then
@@ -323,6 +331,108 @@ contains
         if (present(stat)) stat = ps%stat
 
     contains
+
+        subroutine pcg(b, xs, okk, iters, relres)
+            ! H xs = b by preconditioned conjugate gradients (H in ps%wk%lin), from xs = 0
+            real(dp), intent(in)  :: b(:)
+            real(dp), intent(out) :: xs(:)
+            logical,  intent(out) :: okk
+            integer,  intent(out) :: iters
+            real(dp), intent(out) :: relres
+            real(dp), allocatable :: rr(:), zz(:), pp(:), qq(:)
+            real(dp) :: rz, rzn, bn, al
+            integer  :: m
+            allocate(rr(n), zz(n), pp(n), qq(n))
+            xs = 0.0_dp;  rr = b
+            bn = sqrt(sum(b**2));  okk = .true.;  iters = 0;  relres = 0.0_dp
+            if (.not. bn > 0.0_dp) return
+            call precond(rr, zz)
+            pp = zz;  rz = sum(rr*zz)
+            do m = 1, c%lin_maxit
+                iters = m
+                call matvec(pp, qq)
+                al = rz/sum(pp*qq)
+                xs = xs + al*pp;  rr = rr - al*qq
+                relres = sqrt(sum(rr**2))/bn
+                if (relres < c%lin_tol) return
+                call precond(rr, zz)
+                rzn = sum(rr*zz)
+                pp = zz + (rzn/rz)*pp;  rz = rzn
+            end do
+            okk = .false.
+        end subroutine pcg
+
+        subroutine matvec(v, hv)
+            real(dp), intent(in)  :: v(:)
+            real(dp), intent(out) :: hv(:)
+            integer :: m, z
+            !$omp parallel do private(m, z) schedule(static)
+            do m = 1, n
+                hv(m) = 0.0_dp
+                do z = ps%wk%lin%ia(m), ps%wk%lin%ia(m + 1) - 1
+                    hv(m) = hv(m) + ps%wk%lin%a(z)*v(ps%wk%lin%ja(z))
+                end do
+            end do
+            !$omp end parallel do
+        end subroutine matvec
+
+        subroutine precond(v, zv)
+            ! zv = U^-1 Dp^-1 W^-1 Dp^-T U^-1 v; Dp: D with dpre on
+            ! the diagonal, lower triangular in the order ord (row m: its own column and its upstream neighbours')
+            real(dp), intent(in)  :: v(:)
+            real(dp), intent(out) :: zv(:)
+            integer :: o, m, z, pz
+            ! y = Dp^-T (U^-1 v): from the lowest cell up; wk accumulates sum over downstream rows of D(z, row) y(row)
+            wk = 0.0_dp
+            do o = n, 1, -1
+                m = ord(o)
+                zv(m) = (v(m)/u(m) - wk(m))/dpre(m)
+                do z = 1, 4
+                    pz = sid(z, m)
+                    if (pz > 0 .and. D(z, m) /= 0.0_dp) wk(pz) = wk(pz) + D(z, m)*zv(m)
+                end do
+            end do
+            ! W^-1, then Dp^-1: from the highest cell down
+            zv = zv/w
+            wk = zv
+            do o = 1, n
+                m = ord(o)
+                do z = 1, 4
+                    pz = sid(z, m)
+                    if (pz > 0 .and. D(z, m) /= 0.0_dp) wk(m) = wk(m) - D(z, m)*zv(pz)
+                end do
+                zv(m) = wk(m)/dpre(m)
+            end do
+            zv = zv/u
+        end subroutine precond
+
+        function order_desc(key) result(o)
+            ! the indices of key in descending order (merge sort)
+            real(dp), intent(in) :: key(:)
+            integer, allocatable :: o(:), tmp(:)
+            integer :: nn, width, lo, mid, hi, ia, ib, ko
+            nn = size(key)
+            o = [(ko, ko = 1, nn)];  allocate(tmp(nn))
+            width = 1
+            do while (width < nn)
+                do lo = 1, nn, 2*width
+                    mid = min(lo + width - 1, nn);  hi = min(lo + 2*width - 1, nn)
+                    ia = lo;  ib = mid + 1;  ko = lo
+                    do while (ia <= mid .and. ib <= hi)
+                        if (key(o(ia)) >= key(o(ib))) then
+                            tmp(ko) = o(ia);  ia = ia + 1
+                        else
+                            tmp(ko) = o(ib);  ib = ib + 1
+                        end if
+                        ko = ko + 1
+                    end do
+                    do while (ia <= mid);  tmp(ko) = o(ia);  ia = ia + 1;  ko = ko + 1;  end do
+                    do while (ib <= hi);   tmp(ko) = o(ib);  ib = ib + 1;  ko = ko + 1;  end do
+                end do
+                o = tmp
+                width = 2*width
+            end do
+        end function order_desc
 
         logical function interior(ip, jp)
             ! an ice cell with four ice neighbours
@@ -422,7 +532,7 @@ contains
 
         subroutine objective(xx, jj_, parts)
             real(dp), intent(in)  :: xx(:)
-            real(dp), intent(out) :: jj_, parts(4)
+            real(dp), intent(out) :: jj_, parts(5)
             real(dp), allocatable :: uu(:), aa(:), e(:)
             integer :: m, mq
             uu = exp(xx)
@@ -445,6 +555,7 @@ contains
             end if
             parts(3) = 0.5_dp*sum(((aa - ap)/sa)**2)
             parts(4) = 0.5_dp*sum(merge(min(aa, 0.0_dp)/c%sigma_cold, 0.0_dp, cold)**2)
+            parts(5) = 0.5_dp*sum((min(xx - xlo, 0.0_dp)/c%sigma_def)**2)
             jj_ = sum(parts)
         end subroutine objective
 
