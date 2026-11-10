@@ -7,6 +7,7 @@ program test_steady
     !$ use omp_lib
     use plastic_ice
     use plastic_test_utils
+    use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
 
     implicit none
 
@@ -165,16 +166,31 @@ contains
         block
             real(dp), allocatable :: smb2(:,:), ux2(:,:), uy2(:,:)
             allocate(smb2(n, n), ux2(n, n), uy2(n, n))
-            allocate(sl%beta_map(n, n)); sl%beta_map = sl%beta
+            allocate(sl%fric_map(n, n)); sl%fric_map = sl%beta
             call plastic_smb_flux_divergence(ps, z_b, z_sl, mask, r, sl, smb2, stat=st, us_x=ux2, us_y=uy2)
             call check(st == PLASTIC_OK .and. maxval(abs(smb2 - smb)) == 0.0_dp .and. maxval(abs(ux2 - ux)) == 0.0_dp, &
-                       "beta_map = beta: the same implied SMB and velocity")
-            do i = n / 2 + 1, n; sl%beta_map(i, :) = 0.5_dp * sl%beta; end do
+                       "fric_map = beta: the same implied SMB and velocity")
+            do i = n / 2 + 1, n; sl%fric_map(i, :) = 0.5_dp * sl%beta; end do
             call plastic_smb_flux_divergence(ps, z_b, z_sl, mask, r, sl, smb2, stat=st, us_x=ux2, us_y=uy2)
             call check(st == PLASTIC_OK .and. ux2(n / 2 + 8, n / 2) > ux(n / 2 + 8, n / 2) .and. &
                        abs(ux2(n / 2 - 8, n / 2) - ux(n / 2 - 8, n / 2)) < 1.0e-12_dp * abs(ux(n / 2 - 8, n / 2)) + 1.0e-12_dp, &
-                       "beta_map halved in the east: faster there, unchanged in the west")
-            deallocate(sl%beta_map)
+                       "fric_map halved in the east: faster there, unchanged in the west")
+            deallocate(sl%fric_map)
+        end block
+        ! coulomb with a C per cell: a uniform map equal to C gives the uniform result; it needs a speed cap
+        block
+            type(plastic_sliding_t) :: sc
+            real(dp), allocatable :: smb1(:,:), smb2(:,:)
+            allocate(smb1(n, n), smb2(n, n))
+            sc%law = "coulomb"; sc%C = 2.0e5_dp; sc%u_0 = 100.0_dp; sc%m = 3.0_dp; sc%u_max = 3.0e3_dp
+            call plastic_smb_flux_divergence(ps, z_b, z_sl, mask, r, sc, smb1, stat=st)
+            call check(st == PLASTIC_OK .and. all(ieee_is_finite(smb1)), "coulomb u_max: finite implied SMB")
+            allocate(sc%fric_map(n, n)); sc%fric_map = sc%C
+            call plastic_smb_flux_divergence(ps, z_b, z_sl, mask, r, sc, smb2, stat=st)
+            call check(st == PLASTIC_OK .and. maxval(abs(smb2 - smb1)) == 0.0_dp, "coulomb fric_map = C: the same implied SMB")
+            sc%u_max = 0.0_dp
+            call plastic_smb_flux_divergence(ps, z_b, z_sl, mask, r, sc, smb2, stat=st)
+            call check(st == PLASTIC_BAD_INPUT, "coulomb fric_map without u_max: rejected")
         end block
         call plastic_end(ps)
     end subroutine test_margin_outflow

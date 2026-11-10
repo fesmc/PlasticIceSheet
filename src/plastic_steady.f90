@@ -19,7 +19,7 @@ module plastic_steady
     use plastic_solver,   only: plastic_t, check_shape, margin_spacing, &
                                 PLASTIC_OK, PLASTIC_NOT_CONVERGED, PLASTIC_BAD_INPUT
     use plastic_flow,     only: plastic_glen_t, plastic_sliding_t, LAW_COULOMB, &
-                                sliding_law_code, basal_velocity_code, deformational_velocity
+                                sliding_law_code, basal_velocity_code, law_coefficient, deformational_velocity
     use plastic_linsolve, only: lin_reserve, lin_solve, lin_has_lis
 
     implicit none
@@ -354,15 +354,20 @@ contains
             if (present(q_marine)) call check_shape(ps, size(q_marine, 1), size(q_marine, 2), "q_marine")
             if (present(us_x))     call check_shape(ps, size(us_x, 1),     size(us_x, 2),     "us_x")
             if (present(us_y))     call check_shape(ps, size(us_y, 1),     size(us_y, 2),     "us_y")
-            if (allocated(slide%beta_map)) call check_shape(ps, size(slide%beta_map, 1), size(slide%beta_map, 2), "beta_map")
+            if (allocated(slide%fric_map)) then
+                call check_shape(ps, size(slide%fric_map, 1), size(slide%fric_map, 2), "fric_map")
+                if (code == LAW_COULOMB .and. .not. slide%u_max > 0.0_dp) then
+                    ps%stat = PLASTIC_BAD_INPUT
+                    ps%msg  = "plastic_smb_flux_divergence: a coulomb fric_map needs slide%u_max > 0"
+                end if
+            end if
             call margin_spacing(ps, mask, margin_frac)
         end if
         if (present(stat)) stat = ps%stat
         if (ps%stat /= PLASTIC_OK) return
 
-        taucap = huge(1.0_dp)
-        if (code == LAW_COULOMB) taucap = 0.999_dp * slide%C
-        bm = beta_cells(ps, slide)
+        taucap = stress_cap(code, slide)
+        bm = fric_cells(ps, code, slide)
         call steady_margin_values(ps, z_bed, z_sl, ps%wk%sSm, ps%wk%sHm)
         ps%wk%sFp = 0.0_dp
         call steady_residual(ps%nx, ps%ny, ps%H, z_bed, ps%wk%sSm, ps%wk%sHm, mask, ps%wk%dfac, ps%wk%sFp, &
@@ -384,18 +389,30 @@ contains
         end if
     end subroutine plastic_smb_flux_divergence
 
-    ! The sliding beta per cell: slide%beta_map where allocated (shape checked by the caller), else slide%beta.
-    function beta_cells(ps, slide) result(bm)
+    ! The law's coefficient per cell: slide%fric_map where allocated (shape checked by the caller), else the uniform
+    ! beta (linear, weertman) or C (coulomb).
+    function fric_cells(ps, code, slide) result(bm)
         type(plastic_t),         intent(in) :: ps
+        integer,                 intent(in) :: code
         type(plastic_sliding_t), intent(in) :: slide
         real(dp), allocatable :: bm(:,:)
         allocate(bm(ps%nx, ps%ny))
-        if (allocated(slide%beta_map)) then
-            bm = slide%beta_map
+        if (allocated(slide%fric_map)) then
+            bm = slide%fric_map
         else
-            bm = slide%beta
+            bm = law_coefficient(code, slide)
         end if
-    end function beta_cells
+    end function fric_cells
+
+    ! The cap of the driving stress in the fluxes: 0.999 C for a uniform "coulomb" law without a speed cap (a finite
+    ! speed); none otherwise (with u_max the law itself is finite).
+    pure function stress_cap(code, slide) result(taucap)
+        integer,                 intent(in) :: code
+        type(plastic_sliding_t), intent(in) :: slide
+        real(dp) :: taucap
+        taucap = huge(1.0_dp)
+        if (code == LAW_COULOMB .and. .not. slide%u_max > 0.0_dp) taucap = 0.999_dp * slide%C
+    end function stress_cap
 
     ! Steady solve from the initial thickness in ps%H (ps%wk%dfac set by the caller).
     ! Returns the number of pseudo-time steps, the final complementarity residual [m/yr]
@@ -424,10 +441,9 @@ contains
 
         nx = ps%nx; ny = ps%ny; dx = ps%dx; dy = ps%dy
         code = sliding_law_code(slide)
-        bm = beta_cells(ps, slide)
+        bm = fric_cells(ps, code, slide)
         rg = ps%par%rho_i * ps%par%g
-        taucap = huge(1.0_dp)
-        if (code == LAW_COULOMB) taucap = 0.999_dp * slide%C
+        taucap = stress_cap(code, slide)
         call steady_margin_values(ps, z_bed, z_sl, ps%wk%sSm, ps%wk%sHm)
         call lin_reserve(ps%wk%lin, count(mask), 9 * count(mask))
 

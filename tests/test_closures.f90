@@ -72,6 +72,11 @@ contains
                          "coulomb forward relation holds")
         call check(ieee_is_nan(plastic_basal_velocity(rc, rc%C)), "coulomb: NaN at the cap")
         call check(ieee_is_nan(plastic_basal_velocity(rc, 1.2e5_dp)), "coulomb: NaN above the cap")
+        rc%u_max = 1.0e3_dp
+        call check(plastic_basal_velocity(rc, rc%C) == rc%u_max .and. plastic_basal_velocity(rc, 1.2e5_dp) == rc%u_max &
+                   .and. plastic_basal_velocity(rc, 0.999_dp * rc%C) == rc%u_max, "coulomb u_max: the cap at and near C")
+        call check_close(plastic_basal_velocity(rc, tau), ub, 1.0e-14_dp, 0.0_dp, "coulomb u_max: unchanged below it")
+        rc%u_max = 0.0_dp
         small = 1.0e3_dp
         call check_close(plastic_basal_velocity(rc, small), rc%u_0 * (small / rc%C)**rc%m, 1.0e-2_dp, 0.0_dp, &
                          "coulomb low-speed limit is the power law")

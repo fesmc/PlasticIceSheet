@@ -24,7 +24,7 @@ module plastic_flow
     public :: plastic_balance_flux, plastic_balance_velocity, plastic_implied_basal_velocity
     ! for plastic_reconstruct
     public :: LAW_LINEAR, LAW_WEERTMAN, LAW_COULOMB
-    public :: sliding_law_code, basal_velocity_code, deformational_velocity, balance_flux_core
+    public :: sliding_law_code, basal_velocity_code, law_coefficient, deformational_velocity, balance_flux_core
 
     ! Isothermal Glen flow law: depth-averaged deformational speed 2A/(n+2) tau^n H.
     type plastic_glen_t
@@ -35,16 +35,18 @@ module plastic_flow
     ! Basal sliding law, inverted for the sliding speed at the drag tau_b:
     !   "linear"   tau_b = beta u_b                 -> u_b = tau_b / beta
     !   "weertman" tau_b = beta u_b^(1/m)           -> u_b = (tau_b/beta)^m
-    !   "coulomb"  tau_b = C (u_b/(u_b+u_0))^(1/m)  -> u_b = u_0 x/(1-x), x = (tau_b/C)^m,
-    !              NaN where tau_b >= C (bed at its Coulomb cap, speed undetermined).
+    !   "coulomb"  tau_b = C (u_b/(u_b+u_0))^(1/m)  -> u_b = u_0 x/(1-x), x = (tau_b/C)^m, at most u_max;
+    !              where tau_b >= C (bed at its Coulomb cap) u_max, or NaN without a cap (speed undetermined).
     type plastic_sliding_t
         character(len=8) :: law = "weertman"
         real(dp) :: beta = 1.0e4_dp     ! linear [Pa yr m-1], weertman [Pa (yr m-1)^(1/m)]
         real(dp) :: m    = 3.0_dp       ! weertman / coulomb stress exponent
         real(dp) :: C    = 1.0e5_dp     ! coulomb cap [Pa]
         real(dp) :: u_0  = 100.0_dp     ! coulomb threshold speed [m yr-1]
-        real(dp), allocatable :: beta_map(:,:)   ! linear, weertman: beta per cell (units of beta), in place of beta
-                                                 ! where allocated (steady flux, its implied SMB and velocity; plastic_velocity)
+        real(dp) :: u_max = 0.0_dp      ! coulomb speed cap [m yr-1]; 0: none (NaN at the Coulomb cap)
+        real(dp), allocatable :: fric_map(:,:)   ! the law's coefficient per cell, in place of beta (linear, weertman) or C
+                                                 ! (coulomb) where allocated (steady flux, its implied SMB and velocity;
+                                                 ! plastic_velocity)
     end type plastic_sliding_t
 
     integer, parameter :: LAW_LINEAR = 1, LAW_WEERTMAN = 2, LAW_COULOMB = 3
@@ -95,24 +97,28 @@ contains
         end select
     end function sliding_law_code
 
-    ! beta (optional): the beta of the place (beta_map), in place of slide%beta (linear, weertman).
-    elemental function basal_velocity_code(code, slide, tau_b, beta) result(u)
+    ! fric (optional): the law's coefficient at the place (fric_map), in place of slide%beta (linear, weertman) or
+    ! slide%C (coulomb).
+    elemental function basal_velocity_code(code, slide, tau_b, fric) result(u)
         integer,                 intent(in) :: code
         type(plastic_sliding_t), intent(in) :: slide
         real(dp),                intent(in) :: tau_b
-        real(dp), optional,      intent(in) :: beta
+        real(dp), optional,      intent(in) :: fric
         real(dp) :: u, x, b
-        b = slide%beta
-        if (present(beta)) b = beta
+        b = law_coefficient(code, slide)
+        if (present(fric)) b = fric
         select case (code)
         case (LAW_LINEAR)
             u = tau_b / b
         case (LAW_WEERTMAN)
             u = powr(tau_b / b, slide%m)
         case (LAW_COULOMB)
-            if (tau_b < slide%C) then
-                x = powr(tau_b / slide%C, slide%m)
+            if (tau_b < b) then
+                x = powr(tau_b / b, slide%m)
                 u = slide%u_0 * x / (1.0_dp - x)
+                if (slide%u_max > 0.0_dp) u = min(u, slide%u_max)
+            else if (slide%u_max > 0.0_dp) then
+                u = slide%u_max
             else
                 u = NAN_DP
             end if
@@ -120,6 +126,15 @@ contains
             u = NAN_DP
         end select
     end function basal_velocity_code
+
+    ! The uniform coefficient of the law: beta (linear, weertman), C (coulomb).
+    elemental function law_coefficient(code, slide) result(b)
+        integer,                 intent(in) :: code
+        type(plastic_sliding_t), intent(in) :: slide
+        real(dp) :: b
+        b = slide%beta
+        if (code == LAW_COULOMB) b = slide%C
+    end function law_coefficient
 
     ! Sliding speed u_b >= 0 that produces basal drag tau_b (NaN for "coulomb" at or
     ! above its cap, and for an unknown law).
@@ -187,8 +202,8 @@ contains
             if (present(speed)) then
                 if (.not. same_shape(ps, speed)) st = PLASTIC_BAD_INPUT
             end if
-            if (allocated(slide%beta_map)) then
-                if (.not. same_shape(ps, slide%beta_map)) st = PLASTIC_BAD_INPUT
+            if (allocated(slide%fric_map)) then
+                if (.not. same_shape(ps, slide%fric_map)) st = PLASTIC_BAD_INPUT
             end if
             if (present(u_b)) then
                 if (.not. same_shape(ps, u_b)) st = PLASTIC_BAD_INPUT
@@ -208,8 +223,8 @@ contains
             do i = 1, ps%nx
                 if (mask(i, j)) then
                     ud = deformational_velocity(rheo, tau_b(i, j), ps%H(i, j))
-                    if (allocated(slide%beta_map)) then
-                        ub = basal_velocity_code(code, slide, tau_b(i, j), slide%beta_map(i, j))
+                    if (allocated(slide%fric_map)) then
+                        ub = basal_velocity_code(code, slide, tau_b(i, j), slide%fric_map(i, j))
                     else
                         ub = basal_velocity_code(code, slide, tau_b(i, j))
                     end if

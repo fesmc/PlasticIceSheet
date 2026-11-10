@@ -155,13 +155,16 @@ contains
         else if (trim(c%method) /= "steady" .and. trim(c%method) /= "routing") then
             ps%stat = PLASTIC_BAD_INPUT
             ps%msg  = 'plastic_solve_smb: ctrl%method must be "steady" or "routing"'
-        else if (trim(c%method) == "routing" .and. allocated(slide%beta_map)) then
+        else if (trim(c%method) == "routing" .and. allocated(slide%fric_map)) then
             ps%stat = PLASTIC_BAD_INPUT
-            ps%msg  = 'plastic_solve_smb: a sliding beta_map needs ctrl%method = "steady"'
-        else if (allocated(slide%beta_map)) then
-            if (any(shape(slide%beta_map) /= [ps%nx, ps%ny])) then
+            ps%msg  = 'plastic_solve_smb: a sliding fric_map needs ctrl%method = "steady"'
+        else if (allocated(slide%fric_map)) then
+            if (any(shape(slide%fric_map) /= [ps%nx, ps%ny])) then
                 ps%stat = PLASTIC_BAD_INPUT
-                ps%msg  = "plastic_solve_smb: slide%beta_map is not on the grid"
+                ps%msg  = "plastic_solve_smb: slide%fric_map is not on the grid"
+            else if (code == LAW_COULOMB .and. .not. slide%u_max > 0.0_dp) then
+                ps%stat = PLASTIC_BAD_INPUT
+                ps%msg  = "plastic_solve_smb: a coulomb fric_map needs slide%u_max > 0"
             end if
         else if (trim(c%lin) /= "auto" .and. trim(c%lin) /= "lis" .and. trim(c%lin) /= "builtin") then
             ps%stat = PLASTIC_BAD_INPUT
