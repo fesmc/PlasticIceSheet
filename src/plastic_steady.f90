@@ -31,9 +31,9 @@ contains
 
     ! --- flux law ---------------------------------------------------------------------
 
-    ! Normal flux -Hf U(tau, Hf) gn/|g| through a face, g = (gn, gt) the surface slope.
-    pure function face_q(Hf, gn, gt, rg, taucap, code, slide, rheo) result(q)
-        real(dp),                intent(in) :: Hf, gn, gt, rg, taucap
+    ! Normal flux -Hf U(tau, Hf) gn/|g| through a face, g = (gn, gt) the surface slope; bf the sliding beta of the face.
+    pure function face_q(Hf, gn, gt, rg, taucap, code, slide, rheo, bf) result(q)
+        real(dp),                intent(in) :: Hf, gn, gt, rg, taucap, bf
         integer,                 intent(in) :: code
         type(plastic_sliding_t), intent(in) :: slide
         type(plastic_glen_t),    intent(in) :: rheo
@@ -42,7 +42,7 @@ contains
         g = sqrt(gn * gn + gt * gt)
         if (.not. (Hf > 0.0_dp .and. g > 0.0_dp)) return
         tau = min(rg * Hf * g, taucap)
-        u = basal_velocity_code(code, slide, tau) + deformational_velocity(rheo, tau, Hf)
+        u = basal_velocity_code(code, slide, tau, bf) + deformational_velocity(rheo, tau, Hf)
         q = -Hf * u * gn / g
     end function face_q
 
@@ -67,14 +67,14 @@ contains
     end function face_H
 
     ! Outflow from ice cell P to the margin at distance dc (one-sided slope, segment-mean
-    ! thickness with the margin thickness hmM), never inflow.
-    pure function margin_q(HP, hmM, sP, sM, dc, gt, rg, taucap, code, slide, rheo) result(q)
-        real(dp),                intent(in) :: HP, hmM, sP, sM, dc, gt, rg, taucap
+    ! thickness with the margin thickness hmM; bP the sliding beta of P), never inflow.
+    pure function margin_q(HP, hmM, sP, sM, dc, gt, rg, taucap, code, slide, rheo, bP) result(q)
+        real(dp),                intent(in) :: HP, hmM, sP, sM, dc, gt, rg, taucap, bP
         integer,                 intent(in) :: code
         type(plastic_sliding_t), intent(in) :: slide
         type(plastic_glen_t),    intent(in) :: rheo
         real(dp) :: q
-        q = max(face_q(0.5_dp * (HP + hmM), (sM - sP) / dc, gt, rg, taucap, code, slide, rheo), 0.0_dp)
+        q = max(face_q(0.5_dp * (HP + hmM), (sM - sP) / dc, gt, rg, taucap, code, slide, rheo, bP), 0.0_dp)
     end function margin_q
 
     ! Central slope of s at (i,j) along y (dir = 2) or x (dir = 1), clamp-to-edge.
@@ -93,11 +93,12 @@ contains
         end if
     end function cslope
 
-    ! Residual F = div q - smb on the ice cells (0 elsewhere); s, qx, qy are outputs.
+    ! Residual F = div q - smb on the ice cells (0 elsewhere); s, qx, qy are outputs. bm: the sliding beta per cell
+    ! (a face takes the mean of its two cells, a margin face that of its ice cell).
     subroutine steady_residual(nx, ny, H, zb, sm, hm, mask, dfac, smb, dx, dy, rg, taucap, &
-                               code, slide, rheo, s, qx, qy, F)
+                               code, slide, rheo, bm, s, qx, qy, F)
         integer,                 intent(in)  :: nx, ny, code
-        real(dp),                intent(in)  :: H(nx, ny), zb(nx, ny), sm(nx, ny), hm(nx, ny)
+        real(dp),                intent(in)  :: H(nx, ny), zb(nx, ny), sm(nx, ny), hm(nx, ny), bm(nx, ny)
         real(dp),                intent(in)  :: dfac(nx, ny), smb(nx, ny), dx, dy, rg, taucap
         logical,                 intent(in)  :: mask(nx, ny)
         type(plastic_sliding_t), intent(in)  :: slide
@@ -125,13 +126,13 @@ contains
                 if (mask(i, j) .and. mask(i + 1, j)) then
                     qx(i, j) = face_q(face_H(H(i, j), H(i + 1, j), s(i, j), s(i + 1, j)), (s(i + 1, j) - s(i, j)) / dx, &
                                       0.5_dp * (cslope(nx, ny, s, i, j, dy, 2) + cslope(nx, ny, s, i + 1, j, dy, 2)), &
-                                      rg, taucap, code, slide, rheo)
+                                      rg, taucap, code, slide, rheo, 0.5_dp * (bm(i, j) + bm(i + 1, j)))
                 else if (mask(i, j)) then
                     qx(i, j) = margin_q(H(i, j), hm(i + 1, j), s(i, j), s(i + 1, j), dfac(i + 1, j) * dx, &
-                                        cslope(nx, ny, s, i, j, dy, 2), rg, taucap, code, slide, rheo)
+                                        cslope(nx, ny, s, i, j, dy, 2), rg, taucap, code, slide, rheo, bm(i, j))
                 else if (mask(i + 1, j)) then
                     qx(i, j) = -margin_q(H(i + 1, j), hm(i, j), s(i + 1, j), s(i, j), dfac(i, j) * dx, &
-                                         cslope(nx, ny, s, i + 1, j, dy, 2), rg, taucap, code, slide, rheo)
+                                         cslope(nx, ny, s, i + 1, j, dy, 2), rg, taucap, code, slide, rheo, bm(i + 1, j))
                 else
                     qx(i, j) = 0.0_dp
                 end if
@@ -146,13 +147,13 @@ contains
                 else if (mask(i, j) .and. mask(i, j + 1)) then
                     qy(i, j) = face_q(face_H(H(i, j), H(i, j + 1), s(i, j), s(i, j + 1)), (s(i, j + 1) - s(i, j)) / dy, &
                                       0.5_dp * (cslope(nx, ny, s, i, j, dx, 1) + cslope(nx, ny, s, i, j + 1, dx, 1)), &
-                                      rg, taucap, code, slide, rheo)
+                                      rg, taucap, code, slide, rheo, 0.5_dp * (bm(i, j) + bm(i, j + 1)))
                 else if (mask(i, j)) then
                     qy(i, j) = margin_q(H(i, j), hm(i, j + 1), s(i, j), s(i, j + 1), dfac(i, j + 1) * dy, &
-                                        cslope(nx, ny, s, i, j, dx, 1), rg, taucap, code, slide, rheo)
+                                        cslope(nx, ny, s, i, j, dx, 1), rg, taucap, code, slide, rheo, bm(i, j))
                 else if (mask(i, j + 1)) then
                     qy(i, j) = -margin_q(H(i, j + 1), hm(i, j), s(i, j + 1), s(i, j), dfac(i, j) * dy, &
-                                         cslope(nx, ny, s, i, j + 1, dx, 1), rg, taucap, code, slide, rheo)
+                                         cslope(nx, ny, s, i, j + 1, dx, 1), rg, taucap, code, slide, rheo, bm(i, j + 1))
                 else
                     qy(i, j) = 0.0_dp
                 end if
@@ -288,9 +289,9 @@ contains
     ! Surface velocity at the cell centres [m/yr] of the same closure as the face fluxes:
     ! u_b(tau) + 2A/(n+1) tau^n H along -grad s, tau = rho_i g H |grad s| (central slopes of
     ! s, the margin surface on the ice-free cells), capped as the fluxes; 0 off the mask.
-    subroutine surface_velocity(nx, ny, H, s, mask, dx, dy, rg, taucap, code, slide, rheo, ux, uy)
+    subroutine surface_velocity(nx, ny, H, s, mask, dx, dy, rg, taucap, code, slide, rheo, bm, ux, uy)
         integer,                 intent(in)  :: nx, ny, code
-        real(dp),                intent(in)  :: H(nx, ny), s(nx, ny), dx, dy, rg, taucap
+        real(dp),                intent(in)  :: H(nx, ny), s(nx, ny), dx, dy, rg, taucap, bm(nx, ny)
         logical,                 intent(in)  :: mask(nx, ny)
         type(plastic_sliding_t), intent(in)  :: slide
         type(plastic_glen_t),    intent(in)  :: rheo
@@ -308,7 +309,7 @@ contains
                 g = hypot(gx, gy)
                 if (.not. g > 0.0_dp) cycle
                 tau = min(rg * H(i, j) * g, taucap)
-                u = basal_velocity_code(code, slide, tau) + &
+                u = basal_velocity_code(code, slide, tau, bm(i, j)) + &
                     deformational_velocity(rheo, tau, H(i, j)) * (rheo%n + 2.0_dp) / (rheo%n + 1.0_dp)
                 ux(i, j) = -u * gx / g
                 uy(i, j) = -u * gy / g
@@ -336,7 +337,7 @@ contains
         real(dp), optional,      intent(out)   :: q_land(:,:), q_marine(:,:), us_x(:,:), us_y(:,:)
         integer  :: code
         real(dp) :: taucap
-        real(dp), allocatable :: ql(:,:), qm(:,:), ux(:,:), uy(:,:)
+        real(dp), allocatable :: ql(:,:), qm(:,:), ux(:,:), uy(:,:), bm(:,:)
 
         ps%stat = PLASTIC_OK
         ps%msg  = ""
@@ -353,6 +354,7 @@ contains
             if (present(q_marine)) call check_shape(ps, size(q_marine, 1), size(q_marine, 2), "q_marine")
             if (present(us_x))     call check_shape(ps, size(us_x, 1),     size(us_x, 2),     "us_x")
             if (present(us_y))     call check_shape(ps, size(us_y, 1),     size(us_y, 2),     "us_y")
+            if (allocated(slide%beta_map)) call check_shape(ps, size(slide%beta_map, 1), size(slide%beta_map, 2), "beta_map")
             call margin_spacing(ps, mask, margin_frac)
         end if
         if (present(stat)) stat = ps%stat
@@ -360,10 +362,11 @@ contains
 
         taucap = huge(1.0_dp)
         if (code == LAW_COULOMB) taucap = 0.999_dp * slide%C
+        bm = beta_cells(ps, slide)
         call steady_margin_values(ps, z_bed, z_sl, ps%wk%sSm, ps%wk%sHm)
         ps%wk%sFp = 0.0_dp
         call steady_residual(ps%nx, ps%ny, ps%H, z_bed, ps%wk%sSm, ps%wk%sHm, mask, ps%wk%dfac, ps%wk%sFp, &
-                             ps%dx, ps%dy, ps%par%rho_i * ps%par%g, taucap, code, slide, rheo, &
+                             ps%dx, ps%dy, ps%par%rho_i * ps%par%g, taucap, code, slide, rheo, bm, &
                              ps%wk%sS, ps%wk%qx, ps%wk%qy, ps%wk%sF)
         smb = ps%wk%sF
         if (present(q_land) .or. present(q_marine)) then
@@ -375,11 +378,24 @@ contains
         if (present(us_x) .or. present(us_y)) then
             allocate(ux(ps%nx, ps%ny), uy(ps%nx, ps%ny))
             call surface_velocity(ps%nx, ps%ny, ps%H, ps%wk%sS, mask, ps%dx, ps%dy, ps%par%rho_i * ps%par%g, &
-                                  taucap, code, slide, rheo, ux, uy)
+                                  taucap, code, slide, rheo, bm, ux, uy)
             if (present(us_x)) us_x = ux
             if (present(us_y)) us_y = uy
         end if
     end subroutine plastic_smb_flux_divergence
+
+    ! The sliding beta per cell: slide%beta_map where allocated (shape checked by the caller), else slide%beta.
+    function beta_cells(ps, slide) result(bm)
+        type(plastic_t),         intent(in) :: ps
+        type(plastic_sliding_t), intent(in) :: slide
+        real(dp), allocatable :: bm(:,:)
+        allocate(bm(ps%nx, ps%ny))
+        if (allocated(slide%beta_map)) then
+            bm = slide%beta_map
+        else
+            bm = slide%beta
+        end if
+    end function beta_cells
 
     ! Steady solve from the initial thickness in ps%H (ps%wk%dfac set by the caller).
     ! Returns the number of pseudo-time steps, the final complementarity residual [m/yr]
@@ -404,9 +420,11 @@ contains
         real(dp) :: lam
         real(dp) :: rg, taucap, dt, res_new, dx, dy, d, rms, rms_new
         logical  :: lok
+        real(dp), allocatable :: bm(:,:)
 
         nx = ps%nx; ny = ps%ny; dx = ps%dx; dy = ps%dy
         code = sliding_law_code(slide)
+        bm = beta_cells(ps, slide)
         rg = ps%par%rho_i * ps%par%g
         taucap = huge(1.0_dp)
         if (code == LAW_COULOMB) taucap = 0.999_dp * slide%C
@@ -610,7 +628,7 @@ contains
             real(dp), intent(in)  :: Hx(:,:)
             real(dp), intent(out) :: Fx(:,:)
             call steady_residual(nx, ny, Hx, z_bed, ps%wk%sSm, ps%wk%sHm, mask, ps%wk%dfac, smb, dx, dy, &
-                                 rg, taucap, code, slide, rheo, ps%wk%sS, ps%wk%qx, ps%wk%qy, Fx)
+                                 rg, taucap, code, slide, rheo, bm, ps%wk%sS, ps%wk%qx, ps%wk%qy, Fx)
         end subroutine resid
 
     end subroutine steady_solve

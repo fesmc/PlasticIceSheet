@@ -155,6 +155,14 @@ contains
         else if (trim(c%method) /= "steady" .and. trim(c%method) /= "routing") then
             ps%stat = PLASTIC_BAD_INPUT
             ps%msg  = 'plastic_solve_smb: ctrl%method must be "steady" or "routing"'
+        else if (trim(c%method) == "routing" .and. allocated(slide%beta_map)) then
+            ps%stat = PLASTIC_BAD_INPUT
+            ps%msg  = 'plastic_solve_smb: a sliding beta_map needs ctrl%method = "steady"'
+        else if (allocated(slide%beta_map)) then
+            if (any(shape(slide%beta_map) /= [ps%nx, ps%ny])) then
+                ps%stat = PLASTIC_BAD_INPUT
+                ps%msg  = "plastic_solve_smb: slide%beta_map is not on the grid"
+            end if
         else if (trim(c%lin) /= "auto" .and. trim(c%lin) /= "lis" .and. trim(c%lin) /= "builtin") then
             ps%stat = PLASTIC_BAD_INPUT
             ps%msg  = 'plastic_solve_smb: ctrl%lin must be "auto", "lis" or "builtin"'

@@ -161,6 +161,21 @@ contains
         call check(east_land .and. sum(ql) > 0.0_dp, "east of it the outflow is to land")
         call check(down .and. ux(n / 2 + 8, n / 2) > 0.0_dp .and. ux(n / 2 - 8, n / 2) < 0.0_dp, &
                    "surface speed positive on the ice, away from the divide")
+        ! a sliding beta per cell: uniform equal to beta gives the same result; half of it in the east speeds the east up
+        block
+            real(dp), allocatable :: smb2(:,:), ux2(:,:), uy2(:,:)
+            allocate(smb2(n, n), ux2(n, n), uy2(n, n))
+            allocate(sl%beta_map(n, n)); sl%beta_map = sl%beta
+            call plastic_smb_flux_divergence(ps, z_b, z_sl, mask, r, sl, smb2, stat=st, us_x=ux2, us_y=uy2)
+            call check(st == PLASTIC_OK .and. maxval(abs(smb2 - smb)) == 0.0_dp .and. maxval(abs(ux2 - ux)) == 0.0_dp, &
+                       "beta_map = beta: the same implied SMB and velocity")
+            do i = n / 2 + 1, n; sl%beta_map(i, :) = 0.5_dp * sl%beta; end do
+            call plastic_smb_flux_divergence(ps, z_b, z_sl, mask, r, sl, smb2, stat=st, us_x=ux2, us_y=uy2)
+            call check(st == PLASTIC_OK .and. ux2(n / 2 + 8, n / 2) > ux(n / 2 + 8, n / 2) .and. &
+                       abs(ux2(n / 2 - 8, n / 2) - ux(n / 2 - 8, n / 2)) < 1.0e-12_dp * abs(ux(n / 2 - 8, n / 2)) + 1.0e-12_dp, &
+                       "beta_map halved in the east: faster there, unchanged in the west")
+            deallocate(sl%beta_map)
+        end block
         call plastic_end(ps)
     end subroutine test_margin_outflow
 

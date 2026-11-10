@@ -43,6 +43,8 @@ module plastic_flow
         real(dp) :: m    = 3.0_dp       ! weertman / coulomb stress exponent
         real(dp) :: C    = 1.0e5_dp     ! coulomb cap [Pa]
         real(dp) :: u_0  = 100.0_dp     ! coulomb threshold speed [m yr-1]
+        real(dp), allocatable :: beta_map(:,:)   ! linear, weertman: beta per cell (units of beta), in place of beta
+                                                 ! where allocated (steady flux, its implied SMB and velocity; plastic_velocity)
     end type plastic_sliding_t
 
     integer, parameter :: LAW_LINEAR = 1, LAW_WEERTMAN = 2, LAW_COULOMB = 3
@@ -93,16 +95,20 @@ contains
         end select
     end function sliding_law_code
 
-    elemental function basal_velocity_code(code, slide, tau_b) result(u)
+    ! beta (optional): the beta of the place (beta_map), in place of slide%beta (linear, weertman).
+    elemental function basal_velocity_code(code, slide, tau_b, beta) result(u)
         integer,                 intent(in) :: code
         type(plastic_sliding_t), intent(in) :: slide
         real(dp),                intent(in) :: tau_b
-        real(dp) :: u, x
+        real(dp), optional,      intent(in) :: beta
+        real(dp) :: u, x, b
+        b = slide%beta
+        if (present(beta)) b = beta
         select case (code)
         case (LAW_LINEAR)
-            u = tau_b / slide%beta
+            u = tau_b / b
         case (LAW_WEERTMAN)
-            u = powr(tau_b / slide%beta, slide%m)
+            u = powr(tau_b / b, slide%m)
         case (LAW_COULOMB)
             if (tau_b < slide%C) then
                 x = powr(tau_b / slide%C, slide%m)
@@ -181,6 +187,9 @@ contains
             if (present(speed)) then
                 if (.not. same_shape(ps, speed)) st = PLASTIC_BAD_INPUT
             end if
+            if (allocated(slide%beta_map)) then
+                if (.not. same_shape(ps, slide%beta_map)) st = PLASTIC_BAD_INPUT
+            end if
             if (present(u_b)) then
                 if (.not. same_shape(ps, u_b)) st = PLASTIC_BAD_INPUT
             end if
@@ -199,7 +208,11 @@ contains
             do i = 1, ps%nx
                 if (mask(i, j)) then
                     ud = deformational_velocity(rheo, tau_b(i, j), ps%H(i, j))
-                    ub = basal_velocity_code(code, slide, tau_b(i, j))
+                    if (allocated(slide%beta_map)) then
+                        ub = basal_velocity_code(code, slide, tau_b(i, j), slide%beta_map(i, j))
+                    else
+                        ub = basal_velocity_code(code, slide, tau_b(i, j))
+                    end if
                     s  = ub + ud
                     ux(i, j) = s * ps%wk%ex(i, j)
                     uy(i, j) = s * ps%wk%ey(i, j)

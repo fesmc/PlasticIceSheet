@@ -32,6 +32,9 @@ V = plastic_volume(ps); A = plastic_area(ps, mask); m = plastic_surface_misfit(p
 ! closures
 type(plastic_glen_t)     :: rheo   ! A=1e-16 [Pa^-n yr^-1], n=3
 type(plastic_sliding_t)  :: slide  ! law="linear"|"weertman"|"coulomb", beta, m, C, u_0
+                                   ! beta_map(nx,ny) (optional): linear, weertman beta per cell in place of beta
+                                   ! (steady fluxes: face = mean of its cells, margin face = its ice cell;
+                                   ! plastic_velocity; not with ctrl%method = "routing")
 type(plastic_smb_ctrl_t) :: ctrl   ! method="steady"|"routing";
                                    ! steady: res_tol=1e-6 [m/yr], n_steady=500, dt0=1, dt_max=1e8 [yr],
                                    !   lin="auto"|"lis"|"builtin", lin_tol=1e-8, lin_maxit=2000, verbose;
