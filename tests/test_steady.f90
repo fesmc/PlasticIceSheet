@@ -192,6 +192,19 @@ contains
             call plastic_smb_flux_divergence(ps, z_b, z_sl, mask, r, sc, smb2, stat=st)
             call check(st == PLASTIC_BAD_INPUT, "coulomb fric_map without u_max: rejected")
         end block
+        ! a stress cap per cell: huge changes nothing; at a low value the outflow falls and the totals still close
+        block
+            real(dp), allocatable :: smb3(:,:), cap(:,:), ql3(:,:), qm3(:,:)
+            allocate(smb3(n, n), cap(n, n), ql3(n, n), qm3(n, n))
+            cap = huge(1.0_dp)
+            call plastic_smb_flux_divergence(ps, z_b, z_sl, mask, r, sl, smb3, stat=st, tau_cap=cap)
+            call check(st == PLASTIC_OK .and. maxval(abs(smb3 - smb)) == 0.0_dp, "tau_cap huge: the same implied SMB")
+            cap = 2.0e4_dp
+            call plastic_smb_flux_divergence(ps, z_b, z_sl, mask, r, sl, smb3, stat=st, q_land=ql3, q_marine=qm3, tau_cap=cap)
+            call check(st == PLASTIC_OK .and. sum(ql3 + qm3) < sum(ql + qm) .and. &
+                       abs(sum(smb3) - sum(ql3 + qm3)) < 1.0e-9_dp * sum(ql3 + qm3), &
+                       "tau_cap 20 kPa: less outflow, sum(smb) = the outflow")
+        end block
         call plastic_end(ps)
     end subroutine test_margin_outflow
 
