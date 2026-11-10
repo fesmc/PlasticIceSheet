@@ -9,20 +9,23 @@ module plastic_inversion
     !              decouples odd and even cells along a flowline; a margin face's outflow at its ice cell's speed);
     !              the outflow to land is ablated in its margin cell, so it is left out of a (as smb - q_land of
     !              plastic_smb_flux_divergence), the outflow to the ocean is in a (and in q_marine);
-    !   objective  J = 1/2 sum ((x - x_law)/sigma_u)^2 + 1/2 sum_faces (L/d)^2 ((e_A - e_B)/sigma_u)^2
-    !                + 1/2 sum ((a - a_prior)/sigma_a)^2 + 1/2 sum_cold (min(a, 0)/sigma_cold)^2,
-    !              e = x - x_law, U_law the closure's speed at the cell (u_b + u_def at tau = min(rho_i g H |grad s|,
-    !              the stress cap)), sigma_a = max(sigma_smb_rel |a_prior|, sigma_smb_min), L = ctrl%smooth, d the
-    !              face's spacing; cold: the ice cells without a margin face where a_prior >= 0;
+    !   objective  J = 1/2 sum ((x - x_law)/sigma_u)^2 + 1/2 sum_faces (L_u/d)^2 ((e_A - e_B)/sigma_u)^2
+    !                + 1/2 sum eps^2 + 1/2 sum_faces (L_a/d)^2 (eps_A - eps_B)^2 + 1/2 sum_cold (min(a, 0)/sigma_cold)^2,
+    !              e = x - x_law, eps = (a - a_prior)/sigma_a, U_law the closure's speed at the cell (u_b + u_def at
+    !              tau = min(rho_i g H |grad s|, the stress cap)), sigma_a = max(sigma_smb_rel |a_prior|, sigma_smb_min),
+    !              L_u = ctrl%smooth (the speed correction), L_a = ctrl%smooth_smb (the error of a: spatially correlated),
+    !              d the face's spacing; cold: the ice cells without a margin face where a_prior >= 0;
     !   soft bound + 1/2 sum (min(x - ln U_def, 0)/sigma_def)^2: the speed at least the deformation speed at that
     !              stress (sliding >= 0) within sigma_def, the uncertainty of the rate factor.
     !
-    ! Gauss-Newton on x: each step the sparse SPD system (13-point) of the normal equations H dx = -g, H = Lambda + S +
-    ! B' W B (Lambda the flow-law term, S the smoothness, B = D diag(U) the linearised mass balance, W its weights). The
-    ! mass-balance part dominates by orders of magnitude, so H is solved by conjugate gradients preconditioned with the
-    ! exact inverse of B' W B: with upwind face speeds D is lower triangular when the cells are ordered by descending
-    ! surface, so B^-1 W^-1 B^-T costs two sweeps (the land outflow on the diagonal of the preconditioner's D, so every
-    ! row has one). Backtracking on J. Limits: sigma_u -> 0 gives the flow law's speed; sigma_a -> 0 the balance flux of the prior.
+    ! Gauss-Newton on x: each step the SPD system H dx = -g of the normal equations, H = Lambda + S_u + B' W B
+    ! (Lambda the flow-law and bound terms, S_u the speed smoothness, B = D diag(U) the linearised mass balance, W =
+    ! Sigma^-1 (C + S_a) Sigma^-1 its weights, C the diagonal of the misfit and the cold penalty, S_a the smoothness of
+    ! eps), applied matrix-free. The mass-balance part dominates by orders of magnitude, so H is solved by conjugate
+    ! gradients preconditioned with the inverse of B' W B: with upwind face speeds D is lower triangular when the cells
+    ! are ordered by descending surface, so B^-1 W^-1 B^-T costs two sweeps (the land outflow on the diagonal of the
+    ! preconditioner's D, so every row has one) and W^-1 an inner solve of the screened Laplacian C + S_a (Jacobi-
+    ! preconditioned CG; with L_a = 0 a division). Backtracking on J. Limits: sigma_u -> 0 gives the flow law's speed; sigma_a -> 0 the balance flux of the prior.
     ! Units: m, yr, Pa; a, a_prior, dH/dt in m ice/yr.
 
     use plastic_kinds,    only: dp
@@ -31,7 +34,6 @@ module plastic_inversion
     use plastic_flow,     only: plastic_glen_t, plastic_sliding_t, sliding_law_code, basal_velocity_code, &
                                 deformational_velocity
     use plastic_steady,   only: steady_margin_values, face_H, cslope, cap_cells, fric_cells
-    use plastic_linsolve, only: lin_reserve
 
     implicit none
 
@@ -40,7 +42,8 @@ module plastic_inversion
 
     type plastic_inv_ctrl_t
         real(dp) :: sigma_u = 0.7_dp              ! sd of ln U about the flow law (0.7: a factor 2)
-        real(dp) :: smooth = 0.0_dp               ! [m] the length L of the smoothness of ln U - ln U_law (0: none)
+        real(dp) :: smooth = 0.0_dp               ! [m] the length L_u of the smoothness of ln U - ln U_law (0: none)
+        real(dp) :: smooth_smb = 0.0_dp           ! [m] the length L_a of the smoothness of (a - a_prior)/sigma_a (0: none)
         real(dp) :: sigma_smb_rel = 0.5_dp        ! sd of a relative to |a_prior|
         real(dp) :: sigma_smb_min = 0.1_dp        ! [m ice/yr] its floor
         logical  :: cold = .true.                 ! penalise a < 0 where a_prior >= 0 (ice cells without a margin face)
@@ -58,15 +61,12 @@ module plastic_inversion
         integer  :: iters = 0                     ! Gauss-Newton steps taken
         real(dp) :: J = 0.0_dp                    ! the objective at the solution, its four terms
         real(dp) :: J_law = 0.0_dp, J_smooth = 0.0_dp, J_smb = 0.0_dp, J_cold = 0.0_dp, J_def = 0.0_dp
+        real(dp) :: J_smooth_smb = 0.0_dp
         real(dp) :: J_start = 0.0_dp              ! at U = U_law (the forward closure)
         integer  :: n_bound = 0                   ! cells below the deformation speed (negative sliding)
         integer  :: n_cold_neg = 0                ! cold cells with a < 0
     end type plastic_inv_info_t
 
-    ! the 13-point stencil of the normal equations, ordered by (dj, di): increasing cell ids
-    integer, parameter :: NS = 13
-    integer, parameter :: OFF_I(NS) = [0, -1, 0, 1, -2, -1, 0, 1, 2, -1, 0, 1, 0]
-    integer, parameter :: OFF_J(NS) = [-2, -1, -1, -1, 0, 0, 0, 0, 0, 1, 1, 1, 2]
     ! the 5 cells a mass balance row depends on: self, west, east, south, north
     integer, parameter :: D_I(0:4) = [0, -1, 1, 0, 0], D_J(0:4) = [0, 0, 0, -1, 1]
 
@@ -88,13 +88,13 @@ contains
 
         type(plastic_inv_ctrl_t) :: c
         type(plastic_inv_info_t) :: inf
-        integer  :: nx, ny, code, n, i, j, k, p, it, nh, kk, q, s, t, ii, jj
+        integer  :: nx, ny, code, n, i, j, k, it, kk, s, ii, jj
         integer, allocatable :: id(:,:), ci(:), cj(:), sid(:,:)
         real(dp), allocatable :: sm(:,:), hm(:,:), sf(:,:), cm(:,:), bm(:,:)
         real(dp), allocatable :: D(:,:), cmar(:), clan(:), xlaw(:), xlo(:), x(:), xn(:), dx_(:), g(:), w(:), r(:)
-        real(dp), allocatable :: ap(:), sa(:), dh(:), u(:), a(:), h(:,:), udf(:), sc(:)
+        real(dp), allocatable :: ap(:), sa(:), dh(:), u(:), a(:), udf(:), sc(:), dg(:), eps(:), t1(:), t2(:)
         logical,  allocatable :: cold(:)
-        real(dp) :: rg, tau, ub, ud, gx, gy, sux, suy, Jc, Jn, alpha, lsum(5), lsn(5), lres
+        real(dp) :: rg, tau, ub, ud, gx, gy, sux, suy, tax, tay, Jc, Jn, alpha, lsum(6), lsn(6), lres
         integer  :: lit
         integer,  allocatable :: ord(:)
         real(dp), allocatable :: dpre(:), wk(:)
@@ -110,10 +110,10 @@ contains
             ps%msg  = "plastic_smb_inversion: not initialized or unknown sliding law"
         else if (.not. (c%sigma_u > 0.0_dp .and. c%sigma_smb_min > 0.0_dp .and. c%sigma_smb_rel >= 0.0_dp .and. &
                         c%sigma_cold > 0.0_dp .and. c%sigma_def > 0.0_dp .and. c%smooth >= 0.0_dp .and. &
-                        c%u_min > 0.0_dp)) then
+                        c%smooth_smb >= 0.0_dp .and. c%u_min > 0.0_dp)) then
             ps%stat = PLASTIC_BAD_INPUT
             ps%msg  = "plastic_smb_inversion: sigma_u, sigma_smb_min, sigma_cold, sigma_def, u_min > 0; sigma_smb_rel, "// &
-                      "smooth >= 0"
+                      "smooth, smooth_smb >= 0"
         else
             call check_shape(ps, size(z_bed, 1), size(z_bed, 2), "z_bed")
             call check_shape(ps, size(z_sl, 1), size(z_sl, 2), "z_sl")
@@ -211,11 +211,8 @@ contains
                 if (ii >= 1 .and. ii <= nx .and. jj >= 1 .and. jj <= ny) sid(s, k) = id(ii, jj)
             end do
         end do
-        sux = 0.0_dp;  suy = 0.0_dp
-        if (c%smooth > 0.0_dp) then
-            sux = (c%smooth/ps%dx)**2/c%sigma_u**2
-            suy = (c%smooth/ps%dy)**2/c%sigma_u**2
-        end if
+        sux = (c%smooth/ps%dx)**2/c%sigma_u**2;  suy = (c%smooth/ps%dy)**2/c%sigma_u**2
+        tax = (c%smooth_smb/ps%dx)**2;           tay = (c%smooth_smb/ps%dy)**2
 
         ! --- Gauss-Newton -------------------------------------------------------------------------------------------
         ! the preconditioner: cells by descending surface (the upwind mass balance is lower triangular in that order),
@@ -224,64 +221,32 @@ contains
         dpre = D(0, :) + clan
         where (.not. dpre > 0.0_dp) dpre = 1.0e-3_dp*max(maxval(dpre), tiny(1.0_dp))
         allocate(wk(n))
-        allocate(x(n), xn(n), dx_(n), g(n), w(n), r(n), u(n), a(n), h(NS, n), sc(n))
+        allocate(x(n), xn(n), dx_(n), g(n), w(n), r(n), u(n), a(n), sc(n), dg(n), eps(n), t1(n), t2(n))
         x = xlaw
         call objective(x, Jc, lsum)
         inf%J_start = Jc
         conv = .false.
-        call lin_reserve(ps%wk%lin, n, NS*n)
         do it = 1, c%n_iter
             inf%iters = it
-            ! gradient and Hessian at x
+            ! the gradient at x and the diagonal parts of H: w = sigma_a^2 C (>= 1; the cold penalty where active),
+            ! dg = Lambda
             u = exp(x)
             call mass(u, a)
-            do k = 1, n
-                w(k) = 1.0_dp/sa(k)**2
-                r(k) = (a(k) - ap(k))*w(k)
-                if (cold(k) .and. a(k) < 0.0_dp) then
-                    w(k) = w(k) + 1.0_dp/c%sigma_cold**2
-                    r(k) = r(k) + a(k)/c%sigma_cold**2
-                end if
-            end do
-            g = (x - xlaw)/c%sigma_u**2
-            h = 0.0_dp
-            h(7, :) = 1.0_dp/c%sigma_u**2
-            call smooth_terms(x - xlaw, g, h)
-            do k = 1, n
-                do s = 0, 4
-                    p = sid(s, k)
-                    if (p == 0 .or. D(s, k) == 0.0_dp) cycle
-                    g(p) = g(p) + D(s, k)*u(p)*r(k)
-                    do t = 0, 4
-                        q = sid(t, k)
-                        if (q == 0 .or. D(t, k) == 0.0_dp) cycle
-                        kk = slot(D_I(t) - D_I(s), D_J(t) - D_J(s))
-                        h(kk, p) = h(kk, p) + D(s, k)*u(p)*w(k)*D(t, k)*u(q)
-                    end do
-                end do
-            end do
+            eps = (a - ap)/sa
+            w = 1.0_dp
+            where (cold .and. a < 0.0_dp) w = 1.0_dp + (sa/c%sigma_cold)**2
+            call lap(eps, tax, tay, t1)                       ! S_a eps
+            r = (eps + t1)/sa                                 ! dJ/da: the misfit and its smoothness,
+            where (cold .and. a < 0.0_dp) r = r + a/c%sigma_cold**2   ! the cold penalty
+            call bt(r, g)                                     ! B' r
+            call lap(x - xlaw, sux, suy, t1)                  ! S_u e
+            g = g + (x - xlaw)/c%sigma_u**2 + t1
+            dg = 1.0_dp/c%sigma_u**2
             where (x < xlo)
                 g = g + (x - xlo)/c%sigma_def**2
-                h(7, :) = h(7, :) + 1.0_dp/c%sigma_def**2
+                dg = dg + 1.0_dp/c%sigma_def**2
             end where
-            ! the system H dx = -g, by conjugate gradients preconditioned
-            ! with the exact inverse of its mass-balance part (pcg)
-            nh = 0
-            ps%wk%lin%ia(1) = 1
-            do k = 1, n
-                do kk = 1, NS
-                    ii = ci(k) + OFF_I(kk);  jj = cj(k) + OFF_J(kk)
-                    if (ii < 1 .or. ii > nx .or. jj < 1 .or. jj > ny) cycle
-                    q = id(ii, jj)
-                    if (q == 0) cycle
-                    nh = nh + 1
-                    ps%wk%lin%ja(nh) = q
-                    ps%wk%lin%a(nh) = h(kk, k)
-                end do
-                ps%wk%lin%ia(k + 1) = nh + 1
-            end do
-            ps%wk%lin%n = n
-            ps%wk%lin%nnz = nh
+            ! the system H dx = -g, by conjugate gradients preconditioned with the inverse of its mass-balance part
             sc = -g
             call pcg(sc, dx_, ok, lit, lres)
             ! backtracking on J
@@ -321,6 +286,7 @@ contains
         end do
         inf%J = Jc
         inf%J_law = lsum(1);  inf%J_smooth = lsum(2);  inf%J_smb = lsum(3);  inf%J_cold = lsum(4);  inf%J_def = lsum(5)
+        inf%J_smooth_smb = lsum(6)
         inf%n_bound = count(x < xlo - c%sigma_def)
         inf%n_cold_neg = count(cold .and. a < 0.0_dp)
         if (present(info)) info = inf
@@ -333,7 +299,7 @@ contains
     contains
 
         subroutine pcg(b, xs, okk, iters, relres)
-            ! H xs = b by preconditioned conjugate gradients (H in ps%wk%lin), from xs = 0
+            ! H xs = b by preconditioned conjugate gradients (H applied by matvec), from xs = 0
             real(dp), intent(in)  :: b(:)
             real(dp), intent(out) :: xs(:)
             logical,  intent(out) :: okk
@@ -363,18 +329,104 @@ contains
         end subroutine pcg
 
         subroutine matvec(v, hv)
+            ! hv = H v = dg v + S_u v + B' Sigma^-1 (w + S_a) Sigma^-1 B v
             real(dp), intent(in)  :: v(:)
             real(dp), intent(out) :: hv(:)
-            integer :: m, z
-            !$omp parallel do private(m, z) schedule(static)
+            real(dp), allocatable :: y(:), ly(:)
+            allocate(y(n), ly(n))
+            call bv(v, y)
+            y = y/sa
+            call lap(y, tax, tay, ly)
+            y = (w*y + ly)/sa
+            call bt(y, hv)
+            call lap(v, sux, suy, ly)
+            hv = hv + dg*v + ly
+        end subroutine matvec
+
+        subroutine bv(v, y)
+            ! y = B v, B = D diag(U)
+            real(dp), intent(in)  :: v(:)
+            real(dp), intent(out) :: y(:)
+            integer :: m, z, pz
+            !$omp parallel do private(m, z, pz) schedule(static)
             do m = 1, n
-                hv(m) = 0.0_dp
-                do z = ps%wk%lin%ia(m), ps%wk%lin%ia(m + 1) - 1
-                    hv(m) = hv(m) + ps%wk%lin%a(z)*v(ps%wk%lin%ja(z))
+                y(m) = 0.0_dp
+                do z = 0, 4
+                    pz = sid(z, m)
+                    if (pz > 0) y(m) = y(m) + D(z, m)*u(pz)*v(pz)
                 end do
             end do
             !$omp end parallel do
-        end subroutine matvec
+        end subroutine bv
+
+        subroutine bt(y, v)
+            ! v = B' y
+            real(dp), intent(in)  :: y(:)
+            real(dp), intent(out) :: v(:)
+            integer :: m, z, pz
+            v = 0.0_dp
+            do m = 1, n
+                do z = 0, 4
+                    pz = sid(z, m)
+                    if (pz > 0) v(pz) = v(pz) + D(z, m)*u(pz)*y(m)
+                end do
+            end do
+        end subroutine bt
+
+        subroutine lap(v, wx, wy, lv)
+            ! lv = L v, L the graph Laplacian over the faces between ice cells, weights wx (x faces), wy (y faces)
+            real(dp), intent(in)  :: v(:), wx, wy
+            real(dp), intent(out) :: lv(:)
+            integer :: m, z, pz
+            real(dp) :: wt
+            lv = 0.0_dp
+            if (wx <= 0.0_dp .and. wy <= 0.0_dp) return
+            !$omp parallel do private(m, z, pz, wt) schedule(static)
+            do m = 1, n
+                do z = 1, 4
+                    pz = sid(z, m)
+                    if (pz == 0) cycle
+                    wt = merge(wx, wy, z <= 2)
+                    lv(m) = lv(m) + wt*(v(m) - v(pz))
+                end do
+            end do
+            !$omp end parallel do
+        end subroutine lap
+
+        subroutine winv(y, z)
+            ! z = W^-1 y = Sigma (w + S_a)^-1 Sigma y: a division, or Jacobi-preconditioned CG on w + S_a
+            real(dp), intent(in)  :: y(:)
+            real(dp), intent(out) :: z(:)
+            real(dp), allocatable :: bb(:), rr(:), pp(:), qq(:), dd(:), zz(:)
+            real(dp) :: rz, rzn, bn, al
+            integer :: m, z_
+            if (c%smooth_smb <= 0.0_dp) then
+                z = sa*sa*y/w
+                return
+            end if
+            allocate(bb(n), rr(n), pp(n), qq(n), dd(n), zz(n))
+            bb = sa*y
+            dd = w
+            do m = 1, n
+                do z_ = 1, 4
+                    if (sid(z_, m) > 0) dd(m) = dd(m) + merge(tax, tay, z_ <= 2)
+                end do
+            end do
+            z = bb/dd;  call lap(z, tax, tay, qq);  rr = bb - (w*z + qq)
+            bn = sqrt(sum(bb**2))
+            if (bn > 0.0_dp) then
+                zz = rr/dd;  pp = zz;  rz = sum(rr*zz)
+                do m = 1, 2000
+                    call lap(pp, tax, tay, qq);  qq = w*pp + qq
+                    al = rz/sum(pp*qq)
+                    z = z + al*pp;  rr = rr - al*qq
+                    if (sqrt(sum(rr**2)) < 1.0e-10_dp*bn) exit
+                    zz = rr/dd;  rzn = sum(rr*zz)
+                    pp = zz + (rzn/rz)*pp;  rz = rzn
+                end do
+            end if
+            z = sa*z
+        end subroutine winv
 
         subroutine precond(v, zv)
             ! zv = U^-1 Dp^-1 W^-1 Dp^-T U^-1 v; Dp: D with dpre on
@@ -393,8 +445,8 @@ contains
                 end do
             end do
             ! W^-1, then Dp^-1: from the highest cell down
-            zv = zv/w
-            wk = zv
+            call winv(zv, wk)
+            zv = wk
             do o = 1, n
                 m = ord(o)
                 do z = 1, 4
@@ -476,19 +528,6 @@ contains
             end if
         end subroutine outer
 
-        integer function slot(di, dj)
-            ! the position of offset (di, dj) in the 13-point stencil
-            integer, intent(in) :: di, dj
-            integer :: m
-            slot = 0
-            do m = 1, NS
-                if (OFF_I(m) == di .and. OFF_J(m) == dj) then
-                    slot = m
-                    return
-                end if
-            end do
-        end function slot
-
         subroutine mass(uu, aa)
             real(dp), intent(in)  :: uu(:)
             real(dp), intent(out) :: aa(:)
@@ -502,58 +541,23 @@ contains
             end do
         end subroutine mass
 
-        subroutine smooth_terms(e, gg, hh)
-            ! the smoothness term: gradient and Hessian (5-point)
-            real(dp), intent(in)    :: e(:)
-            real(dp), intent(inout) :: gg(:), hh(:,:)
-            integer :: m, mq
-            if (c%smooth <= 0.0_dp) return
-            do m = 1, n
-                if (ci(m) < nx) then
-                    mq = id(ci(m) + 1, cj(m))
-                    if (mq > 0) call smooth_pair(e, gg, hh, m, mq, 8, 6, sux)
-                end if
-                if (cj(m) < ny) then
-                    mq = id(ci(m), cj(m) + 1)
-                    if (mq > 0) call smooth_pair(e, gg, hh, m, mq, 11, 3, suy)
-                end if
-            end do
-        end subroutine smooth_terms
-
-        subroutine smooth_pair(e, gg, hh, ma, mb, sab, sba, wt)
-            ! one face of the smoothness term: cells ma, mb, mb in slot sab of ma, ma in slot sba of mb
-            real(dp), intent(in)    :: e(:), wt
-            real(dp), intent(inout) :: gg(:), hh(:,:)
-            integer,  intent(in)    :: ma, mb, sab, sba
-            gg(ma) = gg(ma) + wt*(e(ma) - e(mb));  gg(mb) = gg(mb) - wt*(e(ma) - e(mb))
-            hh(7, ma) = hh(7, ma) + wt;  hh(7, mb) = hh(7, mb) + wt
-            hh(sab, ma) = hh(sab, ma) - wt;  hh(sba, mb) = hh(sba, mb) - wt
-        end subroutine smooth_pair
-
         subroutine objective(xx, jj_, parts)
             real(dp), intent(in)  :: xx(:)
-            real(dp), intent(out) :: jj_, parts(5)
-            real(dp), allocatable :: uu(:), aa(:), e(:)
-            integer :: m, mq
+            real(dp), intent(out) :: jj_, parts(6)
+            real(dp), allocatable :: uu(:), aa(:), e(:), ee(:), le(:)
             uu = exp(xx)
             allocate(aa(n))
             call mass(uu, aa)
             e = xx - xlaw
             parts = 0.0_dp
+            allocate(le(n))
             parts(1) = 0.5_dp*sum(e**2)/c%sigma_u**2
-            if (c%smooth > 0.0_dp) then
-                do m = 1, n
-                    if (ci(m) < nx) then
-                        mq = id(ci(m) + 1, cj(m))
-                        if (mq > 0) parts(2) = parts(2) + 0.5_dp*sux*(e(m) - e(mq))**2
-                    end if
-                    if (cj(m) < ny) then
-                        mq = id(ci(m), cj(m) + 1)
-                        if (mq > 0) parts(2) = parts(2) + 0.5_dp*suy*(e(m) - e(mq))**2
-                    end if
-                end do
-            end if
-            parts(3) = 0.5_dp*sum(((aa - ap)/sa)**2)
+            call lap(e, sux, suy, le)
+            parts(2) = 0.5_dp*sum(e*le)                     ! e' L e = sum over faces of w (e_A - e_B)^2
+            ee = (aa - ap)/sa
+            parts(3) = 0.5_dp*sum(ee**2)
+            call lap(ee, tax, tay, le)
+            parts(6) = 0.5_dp*sum(ee*le)
             parts(4) = 0.5_dp*sum(merge(min(aa, 0.0_dp)/c%sigma_cold, 0.0_dp, cold)**2)
             parts(5) = 0.5_dp*sum((min(xx - xlo, 0.0_dp)/c%sigma_def)**2)
             jj_ = sum(parts)

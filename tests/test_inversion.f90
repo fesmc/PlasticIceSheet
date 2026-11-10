@@ -92,6 +92,17 @@ program test_inversion
     write(*, '(a,es10.3,a,es10.3)') "        roughness of ln U - ln U_law: smooth 0 ", rough0, ", 5 dx ", rough1
     call check(st == PLASTIC_OK .and. rough1 < 0.5_dp * rough0, "smooth = 5 dx: a smoother speed correction")
 
+    ! the smoothness of the mass balance's deviation from the prior
+    c%smooth = 0.0_dp;  c%smooth_smb = 0.0_dp
+    call plastic_smb_inversion(ps, z_b, z_sl, mask, r, sl, ap, dh, smb, sp, c, tau_cap=tb, stat=st)
+    rough0 = roughness(smb - ap)
+    c%smooth_smb = 5.0_dp * dx
+    call plastic_smb_inversion(ps, z_b, z_sl, mask, r, sl, ap, dh, smb, sp, c, tau_cap=tb, info=inf, stat=st)
+    rough1 = roughness(smb - ap)
+    write(*, '(a,es10.3,a,es10.3,a,i0,a)') "        roughness of a - prior: smooth_smb 0 ", rough0, ", 5 dx ", rough1, &
+        " (", inf%iters, " steps)"
+    call check(st == PLASTIC_OK .and. rough1 < 0.5_dp * rough0, "smooth_smb = 5 dx: a smoother mass-balance deviation")
+
     call plastic_end(ps)
     call finish("test_inversion")
 
