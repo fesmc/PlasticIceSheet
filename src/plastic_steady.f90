@@ -26,6 +26,7 @@ module plastic_steady
 
     private
     public :: steady_solve, plastic_smb_flux_divergence, steady_margin_values, steady_tau
+    public :: face_H, cslope, cap_cells, fric_cells          ! the face geometry, for plastic_inversion
 
 contains
 

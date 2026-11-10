@@ -60,6 +60,15 @@ call plastic_smb_flux_divergence(ps, z_bed, z_sl, mask, rheo, slide, smb [, marg
                                    ! tau_cap(nx,ny) [Pa]: the driving stress of the fluxes at most tau_cap
                                    ! where > 0 (a face: the mean of its cells, a margin face: its ice cell),
                                    ! e.g. tau_b (a plastic bed carries at most its yield stress)
+call plastic_smb_inversion(ps, z_bed, z_sl, mask, rheo, slide, smb_prior, dHdt, smb, speed [, ctrl, &
+                           margin_frac, tau_cap, q_land, q_marine, u_law, u_def, info, stat])
+                                   ! implied mass balance by joint inversion on the geometry of ps: the speed U
+                                   ! per ice cell (along the plastic flow direction) and smb = dH/dt + div(H U n)
+                                   ! (upwind face speed; land outflow ablated, left out), minimising the misfit
+                                   ! of ln U to the closure's speed (sigma_u, smoothness over ctrl%smooth) and of
+                                   ! smb to smb_prior (sigma_smb_rel, _min), a penalty on smb < 0 where the prior
+                                   ! is >= 0 off the margin (cold), U >= the deformation speed; Gauss-Newton
+                                   ! (plastic_inv_ctrl_t, plastic_inv_info_t); m ice/yr, m/yr
 l = plastic_has_lis()              ! built with lis=1
 u = plastic_basal_velocity(slide, tau_b); u = plastic_deformational_velocity(rheo, tau, H)
 ```

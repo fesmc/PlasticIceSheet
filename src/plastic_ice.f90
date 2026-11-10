@@ -20,6 +20,7 @@ module plastic_ice
     use plastic_reconstruct, only: plastic_smb_ctrl_t, plastic_solve_smb, &
                                    plastic_invert_driving_stress
     use plastic_steady,  only: plastic_smb_flux_divergence
+    use plastic_inversion, only: plastic_inv_ctrl_t, plastic_inv_info_t, plastic_smb_inversion
     use plastic_linsolve, only: plastic_has_lis => lin_has_lis
 
     implicit none
@@ -39,5 +40,6 @@ module plastic_ice
     public :: plastic_balance_flux, plastic_balance_velocity, plastic_implied_basal_velocity
     public :: plastic_smb_ctrl_t, plastic_solve_smb, plastic_invert_driving_stress
     public :: plastic_smb_flux_divergence, plastic_has_lis
+    public :: plastic_inv_ctrl_t, plastic_inv_info_t, plastic_smb_inversion
 
 end module plastic_ice

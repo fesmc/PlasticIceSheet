@@ -43,6 +43,7 @@ plastic_objs = $(objdir)/plastic_kinds.o \
                $(objdir)/plastic_solver.o \
                $(objdir)/plastic_flow.o \
                $(objdir)/plastic_steady.o \
+               $(objdir)/plastic_inversion.o \
                $(objdir)/plastic_reconstruct.o \
                $(objdir)/plastic_ice.o
 
@@ -64,10 +65,13 @@ $(objdir)/plastic_flow.o: $(srcdir)/plastic_flow.f90 $(objdir)/plastic_solver.o
 $(objdir)/plastic_steady.o: $(srcdir)/plastic_steady.f90 $(objdir)/plastic_flow.o
 	$(FC) $(DFLAGS) $(FFLAGS) -c -o $@ $<
 
+$(objdir)/plastic_inversion.o: $(srcdir)/plastic_inversion.f90 $(objdir)/plastic_steady.o
+	$(FC) $(DFLAGS) $(FFLAGS) -c -o $@ $<
+
 $(objdir)/plastic_reconstruct.o: $(srcdir)/plastic_reconstruct.f90 $(objdir)/plastic_steady.o
 	$(FC) $(DFLAGS) $(FFLAGS) -c -o $@ $<
 
-$(objdir)/plastic_ice.o: $(srcdir)/plastic_ice.f90 $(objdir)/plastic_reconstruct.o
+$(objdir)/plastic_ice.o: $(srcdir)/plastic_ice.f90 $(objdir)/plastic_reconstruct.o $(objdir)/plastic_inversion.o
 	$(FC) $(DFLAGS) $(FFLAGS) -c -o $@ $<
 
 ###############################################
@@ -96,7 +100,7 @@ $(objdir)/libplastic.a: $(plastic_objs)
 	@echo " "
 
 # Test programs: no dependencies beyond the library.
-check_progs = test_core test_closures test_surface test_steady
+check_progs = test_core test_closures test_surface test_steady test_inversion
 
 $(objdir)/plastic_test_utils.o: $(testdir)/test_utils.f90 $(objdir)/libplastic.a
 	$(FC) $(DFLAGS) $(FFLAGS) -c -o $@ $<
