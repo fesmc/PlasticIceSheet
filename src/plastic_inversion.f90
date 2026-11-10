@@ -16,9 +16,9 @@ module plastic_inversion
     !              face's spacing; cold: the ice cells without a margin face where a_prior >= 0;
     !   bound      x >= ln U_def (the deformation speed at that stress: sliding >= 0).
     !
-    ! Gauss-Newton on x: each step the sparse SPD system (13-point) of the normal equations, solved with the library's
-    ! linear solver; the bound by projection (an active set: variables at the bound with a positive gradient are held),
-    ! backtracking on J. Limits: sigma_u -> 0 gives the flow law's speed; sigma_a -> 0 the balance flux of the prior.
+    ! Gauss-Newton on x: each step the sparse SPD system (13-point) of the normal equations, scaled symmetrically by its
+    ! diagonal (the terms span many orders of magnitude) and solved inexactly with the library's linear solver; the bound
+    ! by projection (an active set: variables at the bound with a positive gradient are held), backtracking on J. Limits: sigma_u -> 0 gives the flow law's speed; sigma_a -> 0 the balance flux of the prior.
     ! Units: m, yr, Pa; a, a_prior, dH/dt in m ice/yr.
 
     use plastic_kinds,    only: dp
@@ -42,11 +42,11 @@ module plastic_inversion
         logical  :: cold = .true.                 ! penalise a < 0 where a_prior >= 0 (ice cells without a margin face)
         real(dp) :: sigma_cold = 0.01_dp          ! [m ice/yr] the scale of that penalty
         real(dp) :: u_min = 1.0e-3_dp             ! [m/yr] floor of U_law and of the bound
-        integer  :: n_iter = 50                   ! Gauss-Newton steps
-        real(dp) :: tol = 1.0e-6_dp               ! stop at a relative decrease of J below tol
+        integer  :: n_iter = 100                  ! Gauss-Newton steps
+        real(dp) :: tol = 1.0e-6_dp               ! stop at a relative decrease of J below tol with a full step
         character(len=8) :: lin = "auto"         ! "auto" | "lis" | "builtin"
-        real(dp) :: lin_tol = 1.0e-10_dp
-        integer  :: lin_maxit = 5000
+        real(dp) :: lin_tol = 1.0e-6_dp           ! relative residual of the (diagonally scaled) step system
+        integer  :: lin_maxit = 2000
         logical  :: verbose = .false.
     end type plastic_inv_ctrl_t
 
@@ -88,7 +88,7 @@ contains
         integer, allocatable :: id(:,:), ci(:), cj(:), sid(:,:)
         real(dp), allocatable :: sm(:,:), hm(:,:), sf(:,:), cm(:,:), bm(:,:)
         real(dp), allocatable :: D(:,:), cmar(:), clan(:), xlaw(:), xlo(:), x(:), xn(:), dx_(:), g(:), w(:), r(:)
-        real(dp), allocatable :: ap(:), sa(:), dh(:), u(:), a(:), h(:,:), udf(:)
+        real(dp), allocatable :: ap(:), sa(:), dh(:), u(:), a(:), h(:,:), udf(:), sc(:)
         logical,  allocatable :: cold(:), act(:)
         real(dp) :: rg, tau, ub, ud, gx, gy, sux, suy, Jc, Jn, alpha, lsum(4), lsn(4)
         logical  :: ok, use_lis, conv
@@ -210,7 +210,7 @@ contains
 
         ! --- Gauss-Newton -------------------------------------------------------------------------------------------
         use_lis = trim(c%lin) == "lis" .or. (trim(c%lin) == "auto" .and. lin_has_lis())
-        allocate(x(n), xn(n), dx_(n), g(n), w(n), r(n), u(n), a(n), act(n), h(NS, n))
+        allocate(x(n), xn(n), dx_(n), g(n), w(n), r(n), u(n), a(n), act(n), h(NS, n), sc(n))
         x = xlaw
         call objective(x, Jc, lsum)
         inf%J_start = Jc
@@ -247,7 +247,9 @@ contains
                 end do
             end do
             act = x <= xlo + 1.0e-12_dp .and. g > 0.0_dp
-            ! the system H dx = -g (held variables: identity rows and columns)
+            ! the system H dx = -g (held variables: identity rows and columns), scaled: (S H S) y = -S g, dx = S y,
+            ! S = diag(H)^(-1/2)
+            sc = 1.0_dp/sqrt(h(7, :))
             nh = 0
             ps%wk%lin%ia(1) = 1
             do k = 1, n
@@ -261,17 +263,17 @@ contains
                     if (act(k) .or. act(q)) then
                         ps%wk%lin%a(nh) = merge(1.0_dp, 0.0_dp, q == k)
                     else
-                        ps%wk%lin%a(nh) = h(kk, k)
+                        ps%wk%lin%a(nh) = sc(k)*h(kk, k)*sc(q)
                     end if
                 end do
                 ps%wk%lin%ia(k + 1) = nh + 1
-                ps%wk%lin%b(k) = merge(0.0_dp, -g(k), act(k))
+                ps%wk%lin%b(k) = merge(0.0_dp, -sc(k)*g(k), act(k))
                 ps%wk%lin%x(k) = 0.0_dp
             end do
             ps%wk%lin%n = n
             ps%wk%lin%nnz = nh
             call lin_solve(ps%wk%lin, c%lin_tol, c%lin_maxit, use_lis, ok)
-            dx_ = ps%wk%lin%x(1:n)
+            dx_ = sc*ps%wk%lin%x(1:n)
             where (act) dx_ = 0.0_dp
             ! backtracking on J
             alpha = 1.0_dp
@@ -281,13 +283,14 @@ contains
                 if (Jn < Jc) exit
                 alpha = 0.5_dp*alpha
             end do
-            if (c%verbose) write(*, "(a,i4,a,es12.5,a,es10.3,a,i0,a,l1)") "plastic_smb_inversion: it ", it, " J ", Jn, &
-                " step ", alpha, " held ", count(act), " lin ok ", ok
+            if (c%verbose) write(*, "(a,i4,a,es12.5,a,es10.3,a,i0,a,l1,a,i0,a,es9.2)") "plastic_smb_inversion: it ", it, &
+                " J ", Jn, " step ", alpha, " held ", count(act), " lin ok ", ok, " it ", ps%wk%lin%iters, " relres ", &
+                ps%wk%lin%relres
             if (.not. Jn < Jc) then
                 conv = .true.
                 exit
             end if
-            conv = (Jc - Jn) < c%tol*Jc
+            conv = alpha == 1.0_dp .and. (Jc - Jn) < c%tol*Jc      ! a full step that no longer gains
             x = xn;  Jc = Jn;  lsum = lsn
             if (conv) exit
         end do
