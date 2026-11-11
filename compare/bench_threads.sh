@@ -12,7 +12,7 @@
 #   sbatch compare/bench_threads.sh
 set -e
 make clean > /dev/null
-make compare openmp=1 lis=1 config=${config:-dkrz_levante_ifx} > /dev/null
+make compare openmp=1 lis=1 > /dev/null
 export OMP_PROC_BIND=close OMP_PLACES=cores
 for t in 1 4 8 16; do
     OMP_NUM_THREADS=$t ./libplastic/bin/bench_threads.x compare/out

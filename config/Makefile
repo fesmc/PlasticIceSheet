@@ -1,14 +1,13 @@
 .SUFFIXES: .f .F .F90 .f90 .o .mod
 .SHELL: /bin/sh
 
-# Usage:
-#   make static [config=dkrz_levante_ifx] [debug=1] [openmp=1] [pic=1] [lis=1]
-#   make check  [config=...]       build and run the test programs
+# The template of the Makefile: `configme config PlasticIceSheet` writes ./Makefile from it, with the compiler and
+# machine fragments of configme in place of the placeholder below (no machine files in this repository).
+# Usage (of the generated Makefile):
+#   make static [debug=1] [openmp=1] [pic=1] [lis=1]
+#   make check                     build and run the test programs
 #   make clean                     (between compilers: .mod files are compiler-specific)
-#
-# The compiler/machine fragment is config/$(config); config/common.mk follows it.
 
-config ?= dkrz_levante_ifx
 debug  ?= 0
 openmp ?= 0
 pic    ?= 0
@@ -22,7 +21,15 @@ testdir = tests
 # `make` alone prints the targets (the first rule would otherwise be an object rule).
 .DEFAULT_GOAL := usage
 
-include config/$(config)
+## COMPILER CONFIGURATION ##
+# Assembled by configme: the compiler fragment (FC, FFLAGS, FFLAGS_OPENMP, CPPFLAGS_PP, DFLAGS_*), the machine
+# fragment (host-specific overrides) and netCDF (for make compare only).
+
+<COMPILER_CONFIGURATION>
+
+## DEPENDENCY WIRING ##
+# After the fragments, since it references what they set.
+
 include config/common.mk
 
 DFLAGS = $(DFLAGS_NODEBUG)
@@ -81,11 +88,11 @@ $(objdir)/plastic_ice.o: $(srcdir)/plastic_ice.f90 $(objdir)/plastic_reconstruct
 .PHONY: usage all static test check compare clean
 
 usage:
-	@echo "make static [config=<machine>_<compiler>]   -> $(objdir)/libplastic.a + .mod files"
-	@echo "make check  [config=...]                    -> build and run the tests"
-	@echo "make compare                                -> comparison driver (fesm-utils ncio)"
+	@echo "make static [openmp=1] [lis=1] [debug=1] [pic=1]   -> $(objdir)/libplastic.a + .mod files"
+	@echo "make check                                        -> build and run the tests"
+	@echo "make compare                                      -> comparison driver (fesm-utils ncio)"
 	@echo "make clean"
-	@echo "configs: $(notdir $(filter-out config/common.mk,$(wildcard config/*)))"
+	@echo "configured for $(MACHINE), $(COMPILER) (FC=$(FC))"
 
 all: static
 
