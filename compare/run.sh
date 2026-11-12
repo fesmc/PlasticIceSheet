@@ -25,7 +25,7 @@ if [ ! -f $ENV_DIR/Manifest.toml ]; then
         'using Pkg; Pkg.develop(path=ENV["JULIA_PKG"]); Pkg.add("NCDatasets"); Pkg.precompile()'
 fi
 
-make compare config=${config:-dkrz_levante_ifx}
+make compare
 $JULIA --project=$ENV_DIR compare/julia_ref.jl $OUT
 ./libplastic/bin/plastic_compare.x $OUT $CASES
 $JULIA --project=$ENV_DIR compare/compare.jl $OUT $CASES

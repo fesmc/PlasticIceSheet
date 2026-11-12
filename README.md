@@ -12,8 +12,9 @@ flux and velocity, implied SMB, and the SMB-driven reconstruction (steady mass
 conservation solved directly by Newton; optional Lis and OpenMP).
 
 ```bash
-make static config=dkrz_levante_ifx   # -> libplastic/include/libplastic.a + .mod
-make check  config=dkrz_levante_ifx   # tests
+configme config PlasticIceSheet       # the Makefile for this machine (fesmc/configme)
+make static                           # -> libplastic/include/libplastic.a + .mod
+make check                            # tests
 ```
 
 ```fortran
