@@ -4,14 +4,14 @@
 # The template of the Makefile: `configme config PlasticIceSheet` writes ./Makefile from it, with the compiler and
 # machine fragments of configme in place of the placeholder below (no machine files in this repository).
 # Usage (of the generated Makefile):
-#   make static [debug=1] [openmp=1] [pic=1] [lis=1]
+#   make static [debug=1] [openmp=1] [pic=1] [lis=0]   (lis=1 default: the Lis of the linked fesm-utils; lis=0 the built-in solver)
 #   make check                     build and run the test programs
 #   make clean                     (between compilers: .mod files are compiler-specific)
 
 debug  ?= 0
 openmp ?= 0
 pic    ?= 0
-lis    ?= 0
+lis    ?= 1
 
 srcdir  = src
 objdir  = libplastic/include
@@ -88,7 +88,7 @@ $(objdir)/plastic_ice.o: $(srcdir)/plastic_ice.f90 $(objdir)/plastic_reconstruct
 .PHONY: usage all static test check compare clean
 
 usage:
-	@echo "make static [openmp=1] [lis=1] [debug=1] [pic=1]   -> $(objdir)/libplastic.a + .mod files"
+	@echo "make static [openmp=1] [lis=0] [debug=1] [pic=1]   -> $(objdir)/libplastic.a + .mod files"
 	@echo "make check                                        -> build and run the tests"
 	@echo "make compare                                      -> comparison driver (fesm-utils ncio)"
 	@echo "make clean"

@@ -13,7 +13,7 @@ conservation solved directly by Newton; optional Lis and OpenMP).
 
 ```bash
 configme config PlasticIceSheet       # the Makefile for this machine (fesmc/configme)
-make static                           # -> libplastic/include/libplastic.a + .mod
+make static                           # -> libplastic/include/libplastic.a + .mod (Lis of fesm-utils; lis=0 without)
 make check                            # tests
 ```
 
