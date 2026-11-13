@@ -81,6 +81,17 @@ $(objdir)/plastic_reconstruct.o: $(srcdir)/plastic_reconstruct.f90 $(objdir)/pla
 $(objdir)/plastic_ice.o: $(srcdir)/plastic_ice.f90 $(objdir)/plastic_reconstruct.o $(objdir)/plastic_inversion.o
 	$(FC) $(DFLAGS) $(FFLAGS) -c -o $@ $<
 
+# The build switches are stamped in the object folder: a missing stamp (first build, or a switch changed since the
+# last one) is newer than every object, so a library built with other switches (e.g. lis=0, or the other openmp=
+# variant: configme builds both into this folder) is rebuilt instead of looking up to date.
+buildstamp = $(objdir)/.build-openmp$(openmp)-lis$(lis)-pic$(pic)-debug$(debug)
+
+$(buildstamp):
+	rm -f $(objdir)/.build-*
+	touch $@
+
+$(plastic_objs): $(buildstamp)
+
 ###############################################
 ## Targets
 ###############################################
@@ -138,4 +149,4 @@ compare: $(objdir)/libplastic.a
 		-L$(objdir) -lplastic $(LIB_LIS) $(LFLAGS)
 
 clean:
-	rm -f $(objdir)/*.o $(objdir)/*.mod $(objdir)/*.a $(objdir)/*.smod $(bindir)/*.x
+	rm -f $(objdir)/*.o $(objdir)/*.mod $(objdir)/*.a $(objdir)/*.smod $(objdir)/.build-* $(bindir)/*.x
