@@ -259,11 +259,11 @@ contains
     ! nondecreasing in a and b (a monotone scheme; fast sweeping applies). On land (hf = 0)
     ! s = mu H_N/(h + H_N) is nonincreasing, which needs no clamp. The root is bracketed by
     ! lo = the smaller (clamped) neighbour (or zb + hf) and hi = min over the axes of a + mu d
-    ! (s <= mu, so T >= 1 there), and found by Newton safeguarded by bisection.
+    ! (s <= mu, so T >= 1 there), and found by Newton safeguarded by bisection (rtsafe).
     pure function godunov_coulomb(a, da, b, db, zb, mu, hf, p, H_N) result(u)
         real(dp), intent(in) :: a, da, b, db, zb, mu, hf, p, H_N
         real(dp) :: u
-        real(dp) :: ac, bc, lo, lo0, hi, phi, dphi, un, tol
+        real(dp) :: ac, bc, lo, lo0, hi, phi, dphi, un, tol, dxo, dxs
         logical  :: ha, hb
         integer  :: it
 
@@ -293,12 +293,16 @@ contains
             return
         end if
 
-        ! Newton from the upper bracket, bisection when a step leaves (lo, hi). With p = 1 a
-        ! neighbour at this cell's flotation surface makes phi jump at lo (T -> 2 hf/(d mu) as
-        ! h -> hf): a root within tol of lo is lo itself (the ice stays at flotation).
+        ! Newton from the upper bracket, bisection when a step leaves (lo, hi) or does not halve
+        ! the step before last (rtsafe; plain Newton can cycle where s has a steep or kinked
+        ! branch). With p = 1 a neighbour at this cell's flotation surface makes phi jump at lo
+        ! (T -> 2 hf/(d mu) as h -> hf): a root within tol of lo is lo itself (the ice stays at
+        ! flotation).
         lo0 = lo
         u = hi
         call eval(u, phi, dphi)
+        dxo = hi - lo
+        dxs = dxo
         do it = 1, 100
             if (phi >= 0.0_dp) then
                 hi = u
@@ -307,8 +311,11 @@ contains
             end if
             un = 0.5_dp * (lo + hi)
             if (dphi > 0.0_dp) then
-                if (u - phi / dphi > lo .and. u - phi / dphi < hi) un = u - phi / dphi
+                if (u - phi / dphi > lo .and. u - phi / dphi < hi .and. abs(2.0_dp * phi) <= abs(dxo * dphi)) &
+                    un = u - phi / dphi
             end if
+            dxo = dxs
+            dxs = abs(un - u)
             tol = 1.0e-12_dp * max(1.0_dp, u - zb)
             if (abs(un - u) <= tol .or. hi - lo <= tol) then
                 u = un
