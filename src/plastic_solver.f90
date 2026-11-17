@@ -319,24 +319,26 @@ contains
 
     ! Mode "surface" with the Coulomb yield law instead of a given tau_b:
     !
-    !   tau_b = mu N_eff,  N = rho_i g H (1 - H_f/H)^p (0 at or below flotation),
-    !   1/N_eff = 1/N + 1/(rho_i g H_N),  H_f = (rho_w/rho_i) max(z_sl - z_bed, 0),
+    !   tau_b = mu N_eff,  N = rho_i g H max((1 - H_f/H)^p, delta)  ((1 - H_f/H)^p = 0 at or
+    !   below flotation), 1/N_eff = 1/N + 1/(rho_i g H_N),  H_f = (rho_w/rho_i) max(z_sl - z_bed, 0),
     !
-    ! mu (>= 0, per cell) the friction coefficient times any bed factor (kryos: c_f lambda),
-    ! p in [0, 1], H_N > 0 [m]. The surface slope is mu N_eff/(rho_i g H): a constant mu for
-    ! H << H_N on land (a wedge), the Nye profile of tau_b = mu rho_i g H_N for H >> H_N, 0 at
-    ! flotation. One fast-sweeping solve with godunov_coulomb (unique, monotone update for
-    ! p <= 1); ice-free cells hold z_bed + H_f as in solve_surface. ps%tau_b gets the law's
+    ! mu (>= 0, per cell) the friction coefficient times any bed factor (e.g. c_f lambda), and
+    ! the law (plastic_coulomb_law_t): p in [0, 1], H_N > 0 [m], delta in (0, 1]. The surface
+    ! slope is mu N_eff/(rho_i g H): a constant mu for H << H_N on land (a wedge), the Nye
+    ! profile of tau_b = mu rho_i g H_N for H >> H_N, mu delta H_N/(delta H + H_N) at flotation
+    ! (the floor). One fast-sweeping solve with godunov_coulomb (unique, monotone update for
+    ! p <= 1; the floor delta > 0 makes the solution unique and continuous in the bed and sea
+    ! level); ice-free cells hold z_bed + H_f as in solve_surface. ps%tau_b gets the law's
     ! tau_b on the ice (at the cell's H). Only par%mode = "surface" (else PLASTIC_BAD_INPUT);
     ! warm has no effect (a surface solve sweeps from +BIG).
-    subroutine plastic_solve_coulomb(ps, z_bed, z_sl, mu, mask, p, H_N, warm, stat, margin_frac)
-        type(plastic_t),    intent(inout) :: ps
-        real(dp),           intent(in)    :: z_bed(:,:), z_sl(:,:), mu(:,:)
-        logical,            intent(in)    :: mask(:,:)
-        real(dp),           intent(in)    :: p, H_N
-        logical,  optional, intent(in)    :: warm
-        integer,  optional, intent(out)   :: stat
-        real(dp), optional, intent(in)    :: margin_frac(:,:)
+    subroutine plastic_solve_coulomb(ps, z_bed, z_sl, mu, mask, law, warm, stat, margin_frac)
+        type(plastic_t),             intent(inout) :: ps
+        real(dp),                    intent(in)    :: z_bed(:,:), z_sl(:,:), mu(:,:)
+        logical,                     intent(in)    :: mask(:,:)
+        type(plastic_coulomb_law_t), intent(in)    :: law
+        logical,  optional,          intent(in)    :: warm
+        integer,  optional,          intent(out)   :: stat
+        real(dp), optional,          intent(in)    :: margin_frac(:,:)
         integer  :: nx, ny, i, j, ns
         logical  :: ok
         real(dp) :: hf
@@ -349,12 +351,15 @@ contains
             if (trim(ps%par%mode) /= "surface") then
                 ps%stat = PLASTIC_BAD_INPUT
                 ps%msg  = 'plastic_solve_coulomb: par%mode must be "surface" (the Coulomb law has a surface kernel only)'
-            else if (.not. (p >= 0.0_dp .and. p <= 1.0_dp)) then
+            else if (.not. (law%p >= 0.0_dp .and. law%p <= 1.0_dp)) then
                 ps%stat = PLASTIC_BAD_INPUT
-                ps%msg  = "plastic_solve_coulomb: p must be in [0, 1] (the update is monotone for p <= 1)"
-            else if (.not. (H_N > 0.0_dp .and. H_N < BIG)) then
+                ps%msg  = "plastic_solve_coulomb: law%p must be in [0, 1] (the update is monotone for p <= 1)"
+            else if (.not. (law%H_N > 0.0_dp .and. law%H_N < BIG)) then
                 ps%stat = PLASTIC_BAD_INPUT
-                ps%msg  = "plastic_solve_coulomb: H_N must be positive and finite"
+                ps%msg  = "plastic_solve_coulomb: law%H_N must be positive and finite"
+            else if (.not. (law%delta > 0.0_dp .and. law%delta <= 1.0_dp)) then
+                ps%stat = PLASTIC_BAD_INPUT
+                ps%msg  = "plastic_solve_coulomb: law%delta must be in (0, 1] (the floor makes the solution unique)"
             else if (any(mask .and. .not. (mu >= 0.0_dp .and. mu < BIG))) then
                 ps%stat = PLASTIC_BAD_INPUT
                 ps%msg  = "plastic_solve_coulomb: mu must be finite and >= 0 on the ice"
@@ -382,20 +387,20 @@ contains
         end do
         call sweep_eikonal(nx, ny, ps%wk%wc, ps%wk%G, mask, ps%wk%bc, ps%wk%dfac, ps%dx, ps%dy, &
                            ps%par%max_sweeps, ps%par%tol, ns, ok, zb=z_bed, wavefront=wave_on(ps), &
-                           hf=ps%wk%F, p=p, H_N=H_N)
+                           hf=ps%wk%F, law=law)
         call surface_geometry(ps, z_bed, mask, ns, ok, "plastic_solve_coulomb")
-        call plastic_coulomb_taub(ps, z_bed, z_sl, mu, mask, p, H_N)
+        call plastic_coulomb_taub(ps, z_bed, z_sl, mu, mask, law)
         if (present(stat)) stat = ps%stat
     end subroutine plastic_solve_coulomb
 
     ! ps%tau_b [Pa] of the Coulomb law on the stored thickness ps%H (plastic_solve_coulomb,
     ! or a thickness restored from a restart): mu rho_i g N_eff(H)/(rho_i g) on the mask, 0
     ! elsewhere. No input checks (the solve's).
-    subroutine plastic_coulomb_taub(ps, z_bed, z_sl, mu, mask, p, H_N)
-        type(plastic_t), intent(inout) :: ps
-        real(dp),        intent(in)    :: z_bed(:,:), z_sl(:,:), mu(:,:)
-        logical,         intent(in)    :: mask(:,:)
-        real(dp),        intent(in)    :: p, H_N
+    subroutine plastic_coulomb_taub(ps, z_bed, z_sl, mu, mask, law)
+        type(plastic_t),             intent(inout) :: ps
+        real(dp),                    intent(in)    :: z_bed(:,:), z_sl(:,:), mu(:,:)
+        logical,                     intent(in)    :: mask(:,:)
+        type(plastic_coulomb_law_t), intent(in)    :: law
         integer  :: i, j
         real(dp) :: rg
 
@@ -404,7 +409,7 @@ contains
             do i = 1, ps%nx
                 if (mask(i, j)) then
                     ps%tau_b(i, j) = mu(i, j) * rg * coulomb_neff(ps%H(i, j), &
-                                     plastic_flotation_thickness(z_bed(i, j), z_sl(i, j), ps%par), p, H_N)
+                                     plastic_flotation_thickness(z_bed(i, j), z_sl(i, j), ps%par), law)
                 else
                     ps%tau_b(i, j) = 0.0_dp
                 end if
