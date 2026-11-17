@@ -1,7 +1,7 @@
 ! Numerical core of the perfectly-plastic reconstruction: the Godunov update of the
 ! static eikonal |grad u| = F, fast sweeping, the right-hand side of the w = H^2
 ! equation in :flat and :full mode, the Godunov update of the surface equation
-! (mode "surface"), and the Godunov residuals.
+! (mode "surface", constant tau_b or the Coulomb yield law), and the Godunov residuals.
 !
 ! All routines are pure array kernels on explicit-shape (nx,ny) arrays, i = x, j = y.
 ! They carry no state, so several solver instances can run concurrently.
@@ -14,14 +14,14 @@ module plastic_eikonal
     private
     public :: plastic_par_t
     public :: plastic_flotation_thickness
-    public :: godunov_eikonal, godunov_surface
+    public :: godunov_eikonal, godunov_surface, godunov_coulomb, coulomb_neff
     public :: sweep_once, sweep_eikonal, update_at
-    public :: KERNEL_EIKONAL, KERNEL_SURFACE, MARGIN_DMIN
+    public :: KERNEL_EIKONAL, KERNEL_SURFACE, KERNEL_COULOMB, MARGIN_DMIN
     public :: grad_central
     public :: flotation_bc, rhs_flat, rhs_full
     public :: godunov_residual, godunov_residual_surface
 
-    integer,  parameter :: KERNEL_EIKONAL = 1, KERNEL_SURFACE = 2
+    integer,  parameter :: KERNEL_EIKONAL = 1, KERNEL_SURFACE = 2, KERNEL_COULOMB = 3
 
     ! Floor of the spacing factor to an ice-free neighbour, (1 - margin_frac) >= MARGIN_DMIN:
     ! keeps the update well-conditioned as the margin approaches the ice-cell centre.
@@ -212,19 +212,201 @@ contains
 
     end function godunov_surface
 
+    ! Effective-pressure head of the Coulomb yield law, N_eff/(rho_i g) [m], at thickness H
+    ! with flotation thickness hf: N = rho_i g H (1 - hf/H)^p (Leguy et al. 2014; 0 at or
+    ! below flotation), capped smoothly by N_max = rho_i g H_N: 1/N_eff = 1/N + 1/N_max.
+    elemental function coulomb_neff(H, hf, p, H_N) result(ne)
+        real(dp), intent(in) :: H, hf, p, H_N
+        real(dp) :: ne, n
+        if (.not. H > hf) then
+            ne = 0.0_dp
+            return
+        end if
+        if (hf > 0.0_dp) then
+            if (p == 1.0_dp) then
+                n = H - hf
+            else
+                n = H * (1.0_dp - hf / H)**p
+            end if
+        else
+            n = H
+        end if
+        ne = n * H_N / (n + H_N)
+    end function coulomb_neff
+
+    ! Godunov update of the plastic surface equation with the Coulomb yield law,
+    ! tau_b = mu N_eff(H), i.e. the slope |grad z_s| = s(H) = mu N_eff(H) / (rho_i g H)
+    ! (coulomb_neff; mu = c_f lambda of the cell), for the surface u = z_s of a cell with bed
+    ! zb and flotation thickness hf, from the upwind neighbour surfaces a (x, spacing da)
+    ! and b (y, spacing db); p, H_N the law's exponent and cap thickness.
+    !
+    ! The upwind structure of godunov_surface: each axis carries the slope at its edge-mean
+    ! thickness h_a = (H + (a - zb)+)/2 (the neighbour thickness measured from this bed),
+    !
+    !   T_a(u) = (u - a)+ / (da s(h_a)),   T_a^2 + T_b^2 = 1.
+    !
+    ! For s = k/h (constant tau_b = rho_i g k) this is godunov_surface's equation; for a
+    ! constant slope (H << H_N on land) the eikonal with F = mu. On a marine cell (hf > 0)
+    ! a neighbour below this cell's flotation surface is raised to it, a <- max(a, zb + hf)
+    ! (grounded ice is at least at flotation: the step down to a lower neighbour is a
+    ! grounding-line step without basal stress), so u >= zb + hf.
+    !
+    ! Uniqueness and monotonicity: with 0 <= p <= 1 and (after that clamp) every upwind
+    ! a >= zb + hf, each T_a is strictly increasing in u > a and nonincreasing in a:
+    ! d ln s/dh <= p hf/(h (h - hf)) and h - (a - zb) <= h - hf give (u - a) s'/(2 s) <= p hf/h
+    ! < 1; -d ln s/dh <= n/(h (n + H_N)) < 1/h gives the bound in a (a < zb on land: h does not
+    ! depend on a). So sum T^2 - 1 has one root above the upwind values, and the update is
+    ! nondecreasing in a and b (a monotone scheme; fast sweeping applies). On land (hf = 0)
+    ! s = mu H_N/(h + H_N) is nonincreasing, which needs no clamp. The root is bracketed by
+    ! lo = the smaller (clamped) neighbour (or zb + hf) and hi = min over the axes of a + mu d
+    ! (s <= mu, so T >= 1 there), and found by Newton safeguarded by bisection.
+    pure function godunov_coulomb(a, da, b, db, zb, mu, hf, p, H_N) result(u)
+        real(dp), intent(in) :: a, da, b, db, zb, mu, hf, p, H_N
+        real(dp) :: u
+        real(dp) :: ac, bc, lo, lo0, hi, phi, dphi, un, tol
+        logical  :: ha, hb
+        integer  :: it
+
+        ha = a < BIG
+        hb = b < BIG
+        if (.not. (ha .or. hb)) then
+            u = BIG
+            return
+        end if
+        ac = a
+        bc = b
+        if (hf > 0.0_dp) then
+            if (ha) ac = max(a, zb + hf)
+            if (hb) bc = max(b, zb + hf)
+        end if
+        lo = max(min(ac, bc), zb + hf)
+        if (.not. (mu > 0.0_dp)) then
+            u = lo
+            return
+        end if
+        hi = BIG
+        if (ha) hi = min(hi, ac + mu * da)
+        if (hb) hi = min(hi, bc + mu * db)
+        call eval(lo, phi, dphi)
+        if (hi <= lo .or. phi >= 0.0_dp) then
+            u = lo
+            return
+        end if
+
+        ! Newton from the upper bracket, bisection when a step leaves (lo, hi). With p = 1 a
+        ! neighbour at this cell's flotation surface makes phi jump at lo (T -> 2 hf/(d mu) as
+        ! h -> hf): a root within tol of lo is lo itself (the ice stays at flotation).
+        lo0 = lo
+        u = hi
+        call eval(u, phi, dphi)
+        do it = 1, 100
+            if (phi >= 0.0_dp) then
+                hi = u
+            else
+                lo = u
+            end if
+            un = 0.5_dp * (lo + hi)
+            if (dphi > 0.0_dp) then
+                if (u - phi / dphi > lo .and. u - phi / dphi < hi) un = u - phi / dphi
+            end if
+            tol = 1.0e-12_dp * max(1.0_dp, u - zb)
+            if (abs(un - u) <= tol .or. hi - lo <= tol) then
+                u = un
+                exit
+            end if
+            u = un
+            call eval(u, phi, dphi)
+        end do
+        if (u - lo0 <= tol) u = lo0
+
+    contains
+
+        ! phi(uu) = T_a^2 + T_b^2 - 1 and its derivative.
+        pure subroutine eval(uu, f, df)
+            real(dp), intent(in)  :: uu
+            real(dp), intent(out) :: f, df
+            f  = -1.0_dp
+            df = 0.0_dp
+            if (ha) call axis(uu, ac, da, f, df)
+            if (hb) call axis(uu, bc, db, f, df)
+        end subroutine eval
+
+        pure subroutine axis(uu, aa, dd, f, df)
+            real(dp), intent(in)    :: uu, aa, dd
+            real(dp), intent(inout) :: f, df
+            real(dp) :: h, q, dlq, t
+            if (.not. uu > aa) return
+            h = 0.5_dp * (uu - zb + max(aa - zb, 0.0_dp))
+            call ratio(h, q, dlq)
+            if (.not. q > 0.0_dp) then
+                f = BIG
+                return
+            end if
+            t  = (uu - aa) / (dd * mu * q)
+            f  = f + t * t
+            df = df + 2.0_dp * t * (1.0_dp - 0.5_dp * (uu - aa) * dlq) / (dd * mu * q)
+        end subroutine axis
+
+        ! q = s/mu = N_eff/(rho_i g h) at h, and d ln q/dh.
+        pure subroutine ratio(h, q, dlq)
+            real(dp), intent(in)  :: h
+            real(dp), intent(out) :: q, dlq
+            real(dp) :: r, n, c
+            if (hf > 0.0_dp) then
+                if (.not. h > hf) then
+                    q = 0.0_dp
+                    dlq = 0.0_dp
+                    return
+                end if
+                if (p == 1.0_dp) then
+                    r = 1.0_dp - hf / h
+                else
+                    r = (1.0_dp - hf / h)**p
+                end if
+                n   = h * r
+                c   = H_N / (n + H_N)
+                q   = r * c
+                dlq = ((1.0_dp - p) / h + p / (h - hf)) * c - 1.0_dp / h
+            else
+                q   = H_N / (h + H_N)
+                dlq = -1.0_dp / (h + H_N)
+            end if
+        end subroutine ratio
+
+    end function godunov_coulomb
+
+    ! The update of kernel `kind`: KERNEL_EIKONAL (F the slowness), KERNEL_SURFACE (F =
+    ! tau_b/(rho_i g), zb the cell's bed) or KERNEL_COULOMB (F = mu, hf the cell's flotation
+    ! thickness, p, H_N the law's).
+    pure function kernel_update(kind, a, da, b, db, zb, F, hf, p, H_N) result(u)
+        integer,  intent(in) :: kind
+        real(dp), intent(in) :: a, da, b, db, zb, F, hf, p, H_N
+        real(dp) :: u
+        select case (kind)
+        case (KERNEL_EIKONAL)
+            u = godunov_eikonal(a, da, b, db, F)
+        case (KERNEL_SURFACE)
+            u = godunov_surface(a, da, b, db, zb, F)
+        case default
+            u = godunov_coulomb(a, da, b, db, zb, F, hf, p, H_N)
+        end select
+    end function kernel_update
+
     ! Godunov update at ice cell (i,j) from its four neighbours (clamp-to-edge), with the
-    ! eikonal (kind KERNEL_EIKONAL, F = slowness) or the surface kernel (KERNEL_SURFACE,
-    ! F = tau_b/(rho_i g), zbij the cell's bed). The spacing to a neighbour is d dfac(nb):
+    ! eikonal (kind KERNEL_EIKONAL, F = slowness), the surface kernel (KERNEL_SURFACE,
+    ! F = tau_b/(rho_i g), zbij the cell's bed) or the Coulomb surface kernel
+    ! (KERNEL_COULOMB, F = mu, hfij the cell's flotation thickness, p, H_N the law's).
+    ! The spacing to a neighbour is d dfac(nb):
     ! dfac = 1 on ice cells, < 1 on ice-free cells whose margin lies between the two
     ! centres (sub-cell margin position). With equal spacings on both sides of an axis
     ! the upwind neighbour is the smaller one; otherwise the axis term is the Godunov
     ! max_s (u - a_s)+ / d_s over the two sides, i.e. the update is the minimum over the
     ! side combinations. Each candidate is monotone, so the minimum is.
-    pure function update_at(kind, nx, ny, i, j, u, F, zbij, dfac, dx, dy) result(unew)
+    pure function update_at(kind, nx, ny, i, j, u, F, zbij, dfac, dx, dy, hfij, p, H_N) result(unew)
         integer,  intent(in) :: kind, nx, ny, i, j
-        real(dp), intent(in) :: u(nx, ny), F, zbij, dfac(nx, ny), dx, dy
+        real(dp), intent(in) :: u(nx, ny), F, zbij, dfac(nx, ny), dx, dy, hfij, p, H_N
         real(dp) :: unew, ax(2), dxs(2), ay(2), dys(2), c
-        integer  :: im, ip, jm, jp, nxc, nyc, p, q
+        integer  :: im, ip, jm, jp, nxc, nyc, m, q
 
         im = max(i - 1, 1)
         ip = min(i + 1, nx)
@@ -251,12 +433,8 @@ contains
 
         unew = BIG
         do q = 1, nyc
-            do p = 1, nxc
-                if (kind == KERNEL_EIKONAL) then
-                    c = godunov_eikonal(ax(p), dxs(p), ay(q), dys(q), F)
-                else
-                    c = godunov_surface(ax(p), dxs(p), ay(q), dys(q), zbij, F)
-                end if
+            do m = 1, nxc
+                c = kernel_update(kind, ax(m), dxs(m), ay(q), dys(q), zbij, F, hfij, p, H_N)
                 unew = min(unew, c)
             end do
         end do
@@ -266,10 +444,10 @@ contains
     ! cells only, keeps the monotone min, and returns the largest decrease of u. Cells
     ! with equal spacing on both sides of each axis (all but those at a sub-cell margin)
     ! take the single-candidate update inline; the others go through update_at.
-    function sweep_once(kind, nx, ny, u, F, zb, mask, dfac, dx, dy, xdir, ydir) result(change)
+    function sweep_once(kind, nx, ny, u, F, zb, mask, dfac, dx, dy, xdir, ydir, hf, p, H_N) result(change)
         integer,  intent(in)    :: kind, nx, ny
         real(dp), intent(inout) :: u(nx, ny)
-        real(dp), intent(in)    :: F(nx, ny), zb(nx, ny), dfac(nx, ny)
+        real(dp), intent(in)    :: F(nx, ny), zb(nx, ny), dfac(nx, ny), hf(nx, ny), p, H_N
         logical,  intent(in)    :: mask(nx, ny)
         real(dp), intent(in)    :: dx, dy
         integer,  intent(in)    :: xdir, ydir
@@ -299,13 +477,10 @@ contains
                 if (dfac(im, j) == dfac(ip, j) .and. dfac(i, jm) == dfac(i, jp)) then
                     a = min(u(im, j), u(ip, j))
                     b = min(u(i, jm), u(i, jp))
-                    if (kind == KERNEL_EIKONAL) then
-                        unew = godunov_eikonal(a, dx * dfac(im, j), b, dy * dfac(i, jm), F(i, j))
-                    else
-                        unew = godunov_surface(a, dx * dfac(im, j), b, dy * dfac(i, jm), zb(i, j), F(i, j))
-                    end if
+                    unew = kernel_update(kind, a, dx * dfac(im, j), b, dy * dfac(i, jm), zb(i, j), F(i, j), &
+                                         hf(i, j), p, H_N)
                 else
-                    unew = update_at(kind, nx, ny, i, j, u, F(i, j), zb(i, j), dfac, dx, dy)
+                    unew = update_at(kind, nx, ny, i, j, u, F(i, j), zb(i, j), dfac, dx, dy, hf(i, j), p, H_N)
                 end if
                 if (unew < u(i, j)) then
                     change  = max(change, u(i, j) - unew)
@@ -317,28 +492,28 @@ contains
 
     ! sweep_once in wavefront order: the anti-diagonals p + q = const of the sweep
     ! ordering, one after the other, the cells of a diagonal in parallel. A cell reads its
-    ! four neighbours: (p-1,q), (p,q-1) on the previous diagonal (updated) and (p+1,q),
-    ! (p,q+1) on the next (not yet), exactly as in the row-by-row sweep.
-    function sweep_once_wavefront(kind, nx, ny, u, F, zb, mask, dfac, dx, dy, xdir, ydir) result(change)
+    ! four neighbours: (m-1,q), (m,q-1) on the previous diagonal (updated) and (m+1,q),
+    ! (m,q+1) on the next (not yet), exactly as in the row-by-row sweep.
+    function sweep_once_wavefront(kind, nx, ny, u, F, zb, mask, dfac, dx, dy, xdir, ydir, hf, p, H_N) result(change)
         integer,  intent(in)    :: kind, nx, ny
         real(dp), intent(inout) :: u(nx, ny)
-        real(dp), intent(in)    :: F(nx, ny), zb(nx, ny), dfac(nx, ny)
+        real(dp), intent(in)    :: F(nx, ny), zb(nx, ny), dfac(nx, ny), hf(nx, ny), p, H_N
         logical,  intent(in)    :: mask(nx, ny)
         real(dp), intent(in)    :: dx, dy
         integer,  intent(in)    :: xdir, ydir
         real(dp) :: change
-        integer  :: d, p, q, i, j, i0, j0, im, ip, jm, jp
+        integer  :: d, m, q, i, j, i0, j0, im, ip, jm, jp
         real(dp) :: unew, a, b
 
         i0 = 1; if (xdir < 0) i0 = nx
         j0 = 1; if (ydir < 0) j0 = ny
         change = 0.0_dp
-        !$omp parallel private(d, p, q, i, j, im, ip, jm, jp, unew, a, b) reduction(max:change)
+        !$omp parallel private(d, m, q, i, j, im, ip, jm, jp, unew, a, b) reduction(max:change)
         do d = 2, nx + ny
             !$omp do schedule(static)
             do q = max(1, d - nx), min(ny, d - 1)
-                p = d - q
-                i = i0 + (p - 1) * xdir
+                m = d - q
+                i = i0 + (m - 1) * xdir
                 j = j0 + (q - 1) * ydir
                 if (.not. mask(i, j)) cycle
                 im = max(i - 1, 1); ip = min(i + 1, nx)
@@ -346,13 +521,10 @@ contains
                 if (dfac(im, j) == dfac(ip, j) .and. dfac(i, jm) == dfac(i, jp)) then
                     a = min(u(im, j), u(ip, j))
                     b = min(u(i, jm), u(i, jp))
-                    if (kind == KERNEL_EIKONAL) then
-                        unew = godunov_eikonal(a, dx * dfac(im, j), b, dy * dfac(i, jm), F(i, j))
-                    else
-                        unew = godunov_surface(a, dx * dfac(im, j), b, dy * dfac(i, jm), zb(i, j), F(i, j))
-                    end if
+                    unew = kernel_update(kind, a, dx * dfac(im, j), b, dy * dfac(i, jm), zb(i, j), F(i, j), &
+                                         hf(i, j), p, H_N)
                 else
-                    unew = update_at(kind, nx, ny, i, j, u, F(i, j), zb(i, j), dfac, dx, dy)
+                    unew = update_at(kind, nx, ny, i, j, u, F(i, j), zb(i, j), dfac, dx, dy, hf(i, j), p, H_N)
                 end if
                 if (unew < u(i, j)) then
                     change  = max(change, u(i, j) - unew)
@@ -369,8 +541,11 @@ contains
     ! from BIG on ice cells (the monotone scheme only decreases u). The four diagonal
     ! orderings alternate; the early exit needs a full cycle of four. Returns the number
     ! of sweeps and whether tol was reached. With zb present, solves the surface
-    ! equation instead (u = z_s, F = tau_b/(rho_i g), see godunov_surface).
-    subroutine sweep_eikonal(nx, ny, u, F, mask, bc, dfac, dx, dy, max_sweeps, tol, n_sweeps, ok, zb, wavefront)
+    ! equation instead (u = z_s, F = tau_b/(rho_i g), see godunov_surface); with zb, hf,
+    ! p and H_N present, the Coulomb surface equation (F = mu, hf the flotation
+    ! thickness, see godunov_coulomb).
+    subroutine sweep_eikonal(nx, ny, u, F, mask, bc, dfac, dx, dy, max_sweeps, tol, n_sweeps, ok, zb, wavefront, &
+                             hf, p, H_N)
         integer,  intent(in)  :: nx, ny
         real(dp), intent(out) :: u(nx, ny)
         real(dp), intent(in)  :: F(nx, ny), bc(nx, ny), dfac(nx, ny)
@@ -379,12 +554,12 @@ contains
         integer,  intent(in)  :: max_sweeps
         integer,  intent(out) :: n_sweeps
         logical,  intent(out) :: ok
-        real(dp), optional, intent(in) :: zb(nx, ny)
+        real(dp), optional, intent(in) :: zb(nx, ny), hf(nx, ny), p, H_N
         logical,  optional, intent(in) :: wavefront
         integer, parameter :: xd(4) = [1, -1, -1, 1]
         integer, parameter :: yd(4) = [1, 1, -1, -1]
         integer  :: i, j, s, k, kind
-        real(dp) :: change
+        real(dp) :: change, cp, chn
         logical  :: wave
 
         do j = 1, ny
@@ -399,21 +574,39 @@ contains
 
         kind = KERNEL_EIKONAL
         if (present(zb)) kind = KERNEL_SURFACE
+        cp  = 0.0_dp
+        chn = 0.0_dp
+        if (present(zb) .and. present(hf) .and. present(p) .and. present(H_N)) then
+            kind = KERNEL_COULOMB
+            cp   = p
+            chn  = H_N
+        end if
         wave = .false.
         if (present(wavefront)) wave = wavefront
         ok = .false.
         n_sweeps = 0
         do s = 1, max_sweeps
             k = mod(s - 1, 4) + 1
-            if (wave .and. kind == KERNEL_SURFACE) then
-                change = sweep_once_wavefront(kind, nx, ny, u, F, zb, mask, dfac, dx, dy, xd(k), yd(k))
-            else if (wave) then
-                change = sweep_once_wavefront(kind, nx, ny, u, F, F, mask, dfac, dx, dy, xd(k), yd(k))
-            else if (kind == KERNEL_SURFACE) then
-                change = sweep_once(kind, nx, ny, u, F, zb, mask, dfac, dx, dy, xd(k), yd(k))
-            else
-                change = sweep_once(kind, nx, ny, u, F, F, mask, dfac, dx, dy, xd(k), yd(k))
-            end if
+            select case (kind)
+            case (KERNEL_COULOMB)
+                if (wave) then
+                    change = sweep_once_wavefront(kind, nx, ny, u, F, zb, mask, dfac, dx, dy, xd(k), yd(k), hf, cp, chn)
+                else
+                    change = sweep_once(kind, nx, ny, u, F, zb, mask, dfac, dx, dy, xd(k), yd(k), hf, cp, chn)
+                end if
+            case (KERNEL_SURFACE)
+                if (wave) then
+                    change = sweep_once_wavefront(kind, nx, ny, u, F, zb, mask, dfac, dx, dy, xd(k), yd(k), F, cp, chn)
+                else
+                    change = sweep_once(kind, nx, ny, u, F, zb, mask, dfac, dx, dy, xd(k), yd(k), F, cp, chn)
+                end if
+            case default
+                if (wave) then
+                    change = sweep_once_wavefront(kind, nx, ny, u, F, F, mask, dfac, dx, dy, xd(k), yd(k), F, cp, chn)
+                else
+                    change = sweep_once(kind, nx, ny, u, F, F, mask, dfac, dx, dy, xd(k), yd(k), F, cp, chn)
+                end if
+            end select
             n_sweeps = s
             if (s >= 4 .and. change < tol) then
                 ok = .true.
@@ -534,7 +727,7 @@ contains
             do i = 1, nx
                 if (mask(i, j)) then
                     r(i, j) = w(i, j) - update_at(KERNEL_EIKONAL, nx, ny, i, j, w, F(i, j), 0.0_dp, &
-                                                  dfac, dx, dy)
+                                                  dfac, dx, dy, 0.0_dp, 0.0_dp, 0.0_dp)
                 else
                     r(i, j) = w(i, j) - bc(i, j)
                 end if
@@ -555,7 +748,7 @@ contains
             do i = 1, nx
                 if (mask(i, j)) then
                     r(i, j) = u(i, j) - update_at(KERNEL_SURFACE, nx, ny, i, j, u, K(i, j), zb(i, j), &
-                                                  dfac, dx, dy)
+                                                  dfac, dx, dy, 0.0_dp, 0.0_dp, 0.0_dp)
                 else
                     r(i, j) = u(i, j) - bc(i, j)
                 end if

@@ -13,7 +13,7 @@ module plastic_solver
 
     private
     public :: plastic_t, plastic_work_t
-    public :: plastic_init, plastic_solve, plastic_reset, plastic_end
+    public :: plastic_init, plastic_solve, plastic_solve_coulomb, plastic_coulomb_taub, plastic_reset, plastic_end
     public :: plastic_volume, plastic_area, plastic_surface_misfit, plastic_residual
     public :: plastic_stress_residual, plastic_margin_frac_from_sdist
     public :: margin_spacing
@@ -55,6 +55,8 @@ module plastic_solver
         real(dp), allocatable :: w(:,:)      ! H^2 of the last solve (warm-start state)
         real(dp), allocatable :: H(:,:)      ! ice thickness [m]
         real(dp), allocatable :: z_srf(:,:)  ! ice surface elevation [m] (z_bed off the mask)
+        real(dp), allocatable :: tau_b(:,:)  ! basal shear stress of the last plastic_solve (its input) or
+                                             ! plastic_solve_coulomb (the law) [Pa] on the mask, 0 elsewhere
         integer  :: n_outer_used = 0         ! outer iterations of the last solve
         logical  :: converged    = .false.
         ! Diagnostics of the last solve
@@ -92,10 +94,11 @@ contains
         ps%dx = dx
         ps%dy = dy
 
-        allocate(ps%w(nx, ny), ps%H(nx, ny), ps%z_srf(nx, ny))
+        allocate(ps%w(nx, ny), ps%H(nx, ny), ps%z_srf(nx, ny), ps%tau_b(nx, ny))
         ps%w     = 0.0_dp
         ps%H     = 0.0_dp
         ps%z_srf = 0.0_dp
+        ps%tau_b = 0.0_dp
 
         allocate(ps%wk%G(nx, ny), ps%wk%F(nx, ny), ps%wk%wc(nx, ny), ps%wk%bc(nx, ny))
         allocate(ps%wk%zbx(nx, ny), ps%wk%zby(nx, ny), ps%wk%mask_prev(nx, ny), ps%wk%dfac(nx, ny))
@@ -124,6 +127,7 @@ contains
         if (allocated(ps%w))            deallocate(ps%w)
         if (allocated(ps%H))            deallocate(ps%H)
         if (allocated(ps%z_srf))        deallocate(ps%z_srf)
+        if (allocated(ps%tau_b))        deallocate(ps%tau_b)
         if (allocated(ps%wk%G))         deallocate(ps%wk%G)
         if (allocated(ps%wk%F))         deallocate(ps%wk%F)
         if (allocated(ps%wk%wc))        deallocate(ps%wk%wc)
@@ -190,6 +194,12 @@ contains
             if (present(stat)) stat = ps%stat
             return
         end if
+
+        where (mask)
+            ps%tau_b = tau_b
+        elsewhere
+            ps%tau_b = 0.0_dp
+        end where
 
         if (trim(ps%par%mode) == "surface") then
             call solve_surface(ps, z_bed, z_sl, tau_b, mask, stat)
@@ -290,7 +300,7 @@ contains
         real(dp),          intent(in)    :: z_bed(:,:), z_sl(:,:), tau_b(:,:)
         logical,           intent(in)    :: mask(:,:)
         integer, optional, intent(out)   :: stat
-        integer :: nx, ny, i, j, ns, n_unreached
+        integer :: nx, ny, ns
         logical :: ok
 
         nx = ps%nx
@@ -303,9 +313,121 @@ contains
         call surface_bc(ps, z_bed, z_sl, tau_b)
         call sweep_eikonal(nx, ny, ps%wk%wc, ps%wk%G, mask, ps%wk%bc, ps%wk%dfac, ps%dx, ps%dy, &
                            ps%par%max_sweeps, ps%par%tol, ns, ok, zb=z_bed, wavefront=wave_on(ps))
+        call surface_geometry(ps, z_bed, mask, ns, ok, "plastic_solve")
+        if (present(stat)) stat = ps%stat
+    end subroutine solve_surface
+
+    ! Mode "surface" with the Coulomb yield law instead of a given tau_b:
+    !
+    !   tau_b = mu N_eff,  N = rho_i g H (1 - H_f/H)^p (0 at or below flotation),
+    !   1/N_eff = 1/N + 1/(rho_i g H_N),  H_f = (rho_w/rho_i) max(z_sl - z_bed, 0),
+    !
+    ! mu (>= 0, per cell) the friction coefficient times any bed factor (kryos: c_f lambda),
+    ! p in [0, 1], H_N > 0 [m]. The surface slope is mu N_eff/(rho_i g H): a constant mu for
+    ! H << H_N on land (a wedge), the Nye profile of tau_b = mu rho_i g H_N for H >> H_N, 0 at
+    ! flotation. One fast-sweeping solve with godunov_coulomb (unique, monotone update for
+    ! p <= 1); ice-free cells hold z_bed + H_f as in solve_surface. ps%tau_b gets the law's
+    ! tau_b on the ice (at the cell's H). Only par%mode = "surface" (else PLASTIC_BAD_INPUT);
+    ! warm has no effect (a surface solve sweeps from +BIG).
+    subroutine plastic_solve_coulomb(ps, z_bed, z_sl, mu, mask, p, H_N, warm, stat, margin_frac)
+        type(plastic_t),    intent(inout) :: ps
+        real(dp),           intent(in)    :: z_bed(:,:), z_sl(:,:), mu(:,:)
+        logical,            intent(in)    :: mask(:,:)
+        real(dp),           intent(in)    :: p, H_N
+        logical,  optional, intent(in)    :: warm
+        integer,  optional, intent(out)   :: stat
+        real(dp), optional, intent(in)    :: margin_frac(:,:)
+        integer  :: nx, ny, i, j, ns
+        logical  :: ok
+        real(dp) :: hf
+
+        ps%stat = PLASTIC_OK
+        ps%msg  = ""
+        call check_inputs(ps, z_bed, z_sl, mu, mask, "mu")
+        call margin_spacing(ps, mask, margin_frac)
+        if (ps%stat == PLASTIC_OK) then
+            if (trim(ps%par%mode) /= "surface") then
+                ps%stat = PLASTIC_BAD_INPUT
+                ps%msg  = 'plastic_solve_coulomb: par%mode must be "surface" (the Coulomb law has a surface kernel only)'
+            else if (.not. (p >= 0.0_dp .and. p <= 1.0_dp)) then
+                ps%stat = PLASTIC_BAD_INPUT
+                ps%msg  = "plastic_solve_coulomb: p must be in [0, 1] (the update is monotone for p <= 1)"
+            else if (.not. (H_N > 0.0_dp .and. H_N < BIG)) then
+                ps%stat = PLASTIC_BAD_INPUT
+                ps%msg  = "plastic_solve_coulomb: H_N must be positive and finite"
+            else if (any(mask .and. .not. (mu >= 0.0_dp .and. mu < BIG))) then
+                ps%stat = PLASTIC_BAD_INPUT
+                ps%msg  = "plastic_solve_coulomb: mu must be finite and >= 0 on the ice"
+            end if
+        end if
+        if (ps%stat /= PLASTIC_OK) then
+            ps%converged = .false.
+            if (present(stat)) stat = ps%stat
+            return
+        end if
+
+        nx = ps%nx
+        ny = ps%ny
+        ps%n_outer_used = 0
+        ps%outer_change = 0.0_dp
+        ps%warm_used    = .false.
+        ps%n_new_cells  = 0
+        do j = 1, ny
+            do i = 1, nx
+                hf = plastic_flotation_thickness(z_bed(i, j), z_sl(i, j), ps%par)
+                ps%wk%bc(i, j) = z_bed(i, j) + hf
+                ps%wk%F(i, j)  = hf
+                ps%wk%G(i, j)  = mu(i, j)
+            end do
+        end do
+        call sweep_eikonal(nx, ny, ps%wk%wc, ps%wk%G, mask, ps%wk%bc, ps%wk%dfac, ps%dx, ps%dy, &
+                           ps%par%max_sweeps, ps%par%tol, ns, ok, zb=z_bed, wavefront=wave_on(ps), &
+                           hf=ps%wk%F, p=p, H_N=H_N)
+        call surface_geometry(ps, z_bed, mask, ns, ok, "plastic_solve_coulomb")
+        call plastic_coulomb_taub(ps, z_bed, z_sl, mu, mask, p, H_N)
+        if (present(stat)) stat = ps%stat
+    end subroutine plastic_solve_coulomb
+
+    ! ps%tau_b [Pa] of the Coulomb law on the stored thickness ps%H (plastic_solve_coulomb,
+    ! or a thickness restored from a restart): mu rho_i g N_eff(H)/(rho_i g) on the mask, 0
+    ! elsewhere. No input checks (the solve's).
+    subroutine plastic_coulomb_taub(ps, z_bed, z_sl, mu, mask, p, H_N)
+        type(plastic_t), intent(inout) :: ps
+        real(dp),        intent(in)    :: z_bed(:,:), z_sl(:,:), mu(:,:)
+        logical,         intent(in)    :: mask(:,:)
+        real(dp),        intent(in)    :: p, H_N
+        integer  :: i, j
+        real(dp) :: rg
+
+        rg = ps%par%rho_i * ps%par%g
+        do j = 1, ps%ny
+            do i = 1, ps%nx
+                if (mask(i, j)) then
+                    ps%tau_b(i, j) = mu(i, j) * rg * coulomb_neff(ps%H(i, j), &
+                                     plastic_flotation_thickness(z_bed(i, j), z_sl(i, j), ps%par), p, H_N)
+                else
+                    ps%tau_b(i, j) = 0.0_dp
+                end if
+            end do
+        end do
+    end subroutine plastic_coulomb_taub
+
+    ! The geometry of a surface-mode sweep (ps%wk%wc, margins in ps%wk%bc): z_s, H, w on the
+    ! ice, z_bed off it; the sweep count and convergence; the status (finalize_status).
+    subroutine surface_geometry(ps, z_bed, mask, ns, ok, who)
+        type(plastic_t),  intent(inout) :: ps
+        real(dp),         intent(in)    :: z_bed(:,:)
+        logical,          intent(in)    :: mask(:,:)
+        integer,          intent(in)    :: ns
+        logical,          intent(in)    :: ok
+        character(len=*), intent(in)    :: who
+        integer :: nx, ny, i, j, n_unreached
+
+        nx = ps%nx
+        ny = ps%ny
         ps%n_sweeps  = ns
         ps%converged = ok
-        if (.not. ok) ps%msg = "plastic_solve: surface sweep reached max_sweeps"
+        if (.not. ok) ps%msg = who//": surface sweep reached max_sweeps"
 
         n_unreached = 0
         do j = 1, ny
@@ -327,8 +449,7 @@ contains
             end do
         end do
         call finalize_status(ps, mask, n_unreached)
-        if (present(stat)) stat = ps%stat
-    end subroutine solve_surface
+    end subroutine surface_geometry
 
     ! Surface-mode boundary values bc = z_bed + H_flt (all cells) and K = tau_b/(rho_i g)
     ! in ps%wk%bc and ps%wk%G.
@@ -440,10 +561,13 @@ contains
         end if
     end subroutine check_shape
 
-    subroutine check_inputs(ps, z_bed, z_sl, tau_b, mask)
-        type(plastic_t), intent(inout) :: ps
-        real(dp),        intent(in)    :: z_bed(:,:), z_sl(:,:), tau_b(:,:)
-        logical,         intent(in)    :: mask(:,:)
+    ! Initialised, a known mode and sweep, and the shapes; fname names the third field in
+    ! messages (default "tau_b").
+    subroutine check_inputs(ps, z_bed, z_sl, tau_b, mask, fname)
+        type(plastic_t),            intent(inout) :: ps
+        real(dp),                   intent(in)    :: z_bed(:,:), z_sl(:,:), tau_b(:,:)
+        logical,                    intent(in)    :: mask(:,:)
+        character(len=*), optional, intent(in)    :: fname
 
         if (.not. allocated(ps%w)) then
             ps%stat = PLASTIC_BAD_INPUT
@@ -463,7 +587,11 @@ contains
         end if
         call check_shape(ps, size(z_bed, 1), size(z_bed, 2), "z_bed")
         call check_shape(ps, size(z_sl, 1),  size(z_sl, 2),  "z_sl")
-        call check_shape(ps, size(tau_b, 1), size(tau_b, 2), "tau_b")
+        if (present(fname)) then
+            call check_shape(ps, size(tau_b, 1), size(tau_b, 2), fname)
+        else
+            call check_shape(ps, size(tau_b, 1), size(tau_b, 2), "tau_b")
+        end if
         call check_shape(ps, size(mask, 1),  size(mask, 2),  "mask")
     end subroutine check_inputs
 
