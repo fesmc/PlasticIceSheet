@@ -6,7 +6,9 @@ surface equation `|grad z_s| = tau_b / (rho_i g H)` is solved for `w = H^2` as a
 eikonal problem by fast sweeping, on a prescribed grounded-ice mask (`"flat"` mode, or
 `"full"` with the bed-gradient correction by a damped fixed point and an optional warm
 start). Mode `"surface"` (not in the Julia package, recommended) solves the surface
-equation for z_s directly, with the bed relief and no outer iteration. Closures: Glen
+equation for z_s directly, with the bed relief and no outer iteration; with
+`plastic_solve_coulomb` the basal stress follows a Coulomb yield law, tau_b = mu N_eff(H).
+Closures: Glen
 deformation, linear / Weertman / regularized-Coulomb sliding, DIVA velocity, MFD balance
 flux and velocity, implied SMB, and the SMB-driven reconstruction (steady mass
 conservation solved directly by Newton; optional Lis and OpenMP).
