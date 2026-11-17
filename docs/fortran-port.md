@@ -21,9 +21,10 @@ type(plastic_t)      :: ps    ! par, nx, ny, dx, dy, w=H^2, H, z_srf, tau_b, n_o
 
 call plastic_init(ps, nx, ny, dx, dy [, par, stat])
 call plastic_solve(ps, z_bed, z_sl, tau_b, mask [, warm, stat, margin_frac])   ! ps%tau_b = tau_b on the mask
-call plastic_solve_coulomb(ps, z_bed, z_sl, mu, mask, p, H_N [, warm, stat, margin_frac])
+type(plastic_coulomb_law_t) :: law  ! p=1 (in [0, 1]), H_N (required, > 0) [m], delta=0.05 (in (0, 1])
+call plastic_solve_coulomb(ps, z_bed, z_sl, mu, mask, law [, warm, stat, margin_frac])
                               ! "surface" only: tau_b = mu N_eff (Coulomb yield law), ps%tau_b the law's
-call plastic_coulomb_taub(ps, z_bed, z_sl, mu, mask, p, H_N)      ! ps%tau_b of the law on the stored ps%H
+call plastic_coulomb_taub(ps, z_bed, z_sl, mu, mask, law)         ! ps%tau_b of the law on the stored ps%H
 call plastic_residual(ps, z_bed, z_sl, tau_b, mask, r [, stat, margin_frac])  ! Godunov residual (w, or z_s in "surface")
 call plastic_stress_residual(ps, z_bed, z_sl, tau_b, mask, rmax [, r, stat, margin_frac])
                               ! | |grad z_s| rho_i g H - tau_b | / tau_b, upwind gradient, any mode
@@ -244,13 +245,17 @@ counterpart is `plastic_residual` (the Godunov residual of z_s), < 1e-8 m.
 `plastic_solve_coulomb` replaces the given tau_b by a Coulomb yield law (Robinson et al.
 2020, Yelmo):
 
-    tau_b = mu N_eff,   N = rho_i g H (1 - H_f/H)^p  (Leguy et al. 2014; 0 at or below flotation),
+    tau_b = mu N_eff,   N = rho_i g H max((1 - H_f/H)^p, delta),
     1/N_eff = 1/N + 1/N_max,   N_max = rho_i g H_N,   H_f = (rho_w/rho_i) max(z_sl - z_b, 0),
 
-mu >= 0 per cell (the host's c_f times its bed factor lambda), p in [0, 1], H_N > 0 [m]. The
+with (1 - H_f/H)^p = 0 at or below flotation (Leguy et al. 2014) and the floor delta of the
+overburden (as Bueler and van Pelt 2015). mu >= 0 per cell (the host's c_f times its bed
+factor lambda); the law (`plastic_coulomb_law_t`) p in [0, 1], H_N > 0 [m], delta in (0, 1]
+(else PLASTIC_BAD_INPUT). The
 plastic equation rho_i g H |grad z_s| = tau_b becomes a slope law, |grad z_s| = s(H) =
 mu N_eff/(rho_i g H): a constant slope mu for H << H_N on land (a wedge), the Nye profile
-of tau_b = mu rho_i g H_N for H >> H_N, 0 at flotation. ps%tau_b holds mu N_eff of the
+of tau_b = mu rho_i g H_N for H >> H_N, s = mu delta H_N/(delta H + H_N) at flotation (the
+floor). ps%tau_b holds mu N_eff of the
 cell's H after the solve (`plastic_coulomb_taub` recomputes it from a stored H, e.g. after
 a restart). Mode "surface" only (any other: PLASTIC_BAD_INPUT); `warm` has no effect.
 
@@ -263,28 +268,43 @@ which is `godunov_surface`'s equation for s = k/h and the eikonal with F = mu fo
 slope. On a marine cell (H_f > 0) an upwind neighbour below the cell's flotation surface is
 raised to it, a <- max(a, z_b + H_f): grounded ice is at least at flotation, u >= z_b + H_f.
 
-Uniqueness and monotonicity, the condition relied on: 0 <= p <= 1 and every upwind
-neighbour at or above the cell's flotation surface (the clamp; on land, H_f = 0, s =
-mu H_N/(h + H_N) is nonincreasing and needs none). Then d ln s/dh <= p H_f/(h (h - H_f)) and
-h - alpha <= h - H_f give (u - a) s'/(2 s) <= p H_f/h < 1, so each T_a is strictly increasing
-in u; -d ln s/dh < 1/h gives T_a nonincreasing in a. So the update is the unique root and
-nondecreasing in the neighbour values (fast sweeping applies). It is bracketed by the
-smaller (clamped) neighbour and min_a (a + mu d_a) (s <= mu) and found by Newton
-safeguarded by bisection. With p = 1 a neighbour at the cell's own flotation surface makes
-the left side jump at that bound (T -> 2 H_f/(d mu)); the update is then the bound itself
-when 2 H_f > mu d (the ice stays at flotation, as the continuous equation on a flat marine
-bed).
+Uniqueness and monotonicity of the update, the condition relied on: 0 <= p <= 1, 0 < delta
+<= 1 and every upwind neighbour at or above the cell's flotation surface (the clamp; on land,
+H_f = 0, s = mu H_N/(h + H_N) is nonincreasing and needs none). Off the floor d ln s/dh <=
+p H_f/(h (h - H_f)) and h - alpha <= h - H_f give (u - a) s'/(2 s) <= p H_f/h < 1; on the
+floor s = mu delta H_N/(delta h + H_N) is nonincreasing. So each T_a is strictly increasing
+in u; -d ln s/dh < 1/h (both branches) gives T_a nonincreasing in a. So the update is the
+unique root and nondecreasing in the neighbour values (fast sweeping applies). It is
+bracketed by the smaller (clamped) neighbour and min_a (a + mu d_a) (s <= mu) and found by
+Newton safeguarded by bisection, rtsafe-style: bisection also when a Newton step does not
+halve the step before last (plain Newton can cycle across the kink of s at the floor).
+
+Uniqueness of the solution needs delta > 0. The floor bounds the slope of every grounded
+cell from below, s(h) >= mu delta H_N/(delta h + H_N) > 0 (mu > 0), so the update lies above
+the smaller upwind value by at least d s_min/sqrt(2) (one axis has T >= 1/sqrt(2)): the
+scheme is strictly causal, every fixed point is ordered from the margin inward (the
+smallest ice-cell value takes only margin values), so the fixed point is unique and
+continuous in the bed and sea level. Without the floor (delta = 0: N = 0, s = 0 at
+flotation; the law before the floor) cells at their flotation surfaces support each other
+with zero increments (u = a after the clamp). A marine trough whose flotation surface rises
+inland (a retrograde bed) can then sit at flotation or grounded above it: the discrete
+problem has several fixed points, and which one the sweep reaches flips on decimetre
+changes of the bed or sea level (jumps of the ice volume in a coupled run with an Earth
+model, of the order of 10^6 Gt for Antarctica per step). With p = 1 the unfloored law also
+made the left side jump at a neighbour at the cell's own flotation surface (T -> 2 H_f/(d mu));
+the floor removes that too. delta = 0.05 removes the jumps of the coupled runs; 0.02 does not.
 
 Tests (`tests/test_coulomb.f90`):
 
 | test | result |
 |---|---|
-| kernel, 2e5 random land and marine cells, p in [0, 1], H_N 10 m - 10 km | solves its equation to 1e-9 or brackets its root within 1e-9 H; at or above flotation; nondecreasing in a and b |
+| kernel, 2e5 random land and marine cells, p in [0, 1], H_N 10 m - 10 km, delta in (0, 1] | solves its equation to 1e-9 or brackets its root within 1e-9 H; at or above flotation; on a marine cell above the smaller clamped neighbour by >= d s_min/sqrt(2); nondecreasing in a and b |
 | flat land, 1-D, H_N = 100, 1000, 5000 m, dx = 8 km ... 500 m | exact: H^2/2 + H_N H = mu H_N x to 1e-11 |
 | wedge limit (H_N = 1e15 m), sloped bed and a 300 m bed step | z_s linear with slope mu to 1e-9 m; tau_b = mu rho_i g H |
 | Nye limit (H_N = 1e-5 m), bed bump, sub-cell margin | equals the constant-tau surface solve with tau_b = mu rho_i g H_N to 5e-7 (relative) |
-| marine bed rising inland from -800 m vs ODE (p = 1, H_N = 1000 m), dx = 8 ... 1 km | max error 33.9, 17.1, 8.6, 4.3 m (order 1); H >= H_f; H - H_f of the first cell 3.9 ... 0.47 m; tau_b there < 1 % of its maximum |
-| wavefront vs serial sweep; bad mode, p, H_N, mu | bit-identical; PLASTIC_BAD_INPUT |
+| marine bed rising inland from -800 m vs ODE (p = 1, H_N = 1000 m, delta = 0.05), dx = 8 ... 1 km | max error 24.8, 12.4, 6.2, 3.1 m (order 1); H >= H_f; H - H_f of the first cell 5.7 ... 0.71 m; tau_b there the floor's value mu rho_i g N_eff(delta H_f) to 1.3 ... 0.16 % |
+| retrograde trough behind a sill (2-D, 5 km), delta = 0.05: sea level 0 ... 4 m (0.1 m steps), sill depth -300 ... -340 m (1 m steps) | continuous: max\|dH\| per step 1.12 dz (rho_w/rho_i: the trough follows its flotation thickness), largest step \|dV\| 1.0, 1.1 x the median (delta = 1e-6: the same here; the test guards continuity, it does not reproduce a coupled run's jumps) |
+| wavefront vs serial sweep; bad mode, p, H_N, delta (0, < 0, > 1), mu | bit-identical; PLASTIC_BAD_INPUT |
 
 The existing kernels go through the same dispatch (`kernel_update`); `plastic_solve` is
 bit-identical to before in every mode.

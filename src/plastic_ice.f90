@@ -6,7 +6,7 @@
 module plastic_ice
 
     use plastic_kinds,   only: plastic_dp => dp
-    use plastic_eikonal, only: plastic_par_t, plastic_flotation_thickness
+    use plastic_eikonal, only: plastic_par_t, plastic_coulomb_law_t, plastic_flotation_thickness
     use plastic_solver,  only: plastic_t, plastic_init, plastic_solve, plastic_solve_coulomb, &
                                plastic_coulomb_taub, plastic_reset, &
                                plastic_end, plastic_volume, plastic_area, &
@@ -28,7 +28,7 @@ module plastic_ice
 
     private
     public :: plastic_dp            ! = real64; not exported as dp to avoid clashing with host kinds
-    public :: plastic_par_t, plastic_t
+    public :: plastic_par_t, plastic_coulomb_law_t, plastic_t
     public :: plastic_init, plastic_solve, plastic_solve_coulomb, plastic_coulomb_taub, plastic_reset, plastic_end
     public :: plastic_flotation_thickness
     public :: plastic_volume, plastic_area, plastic_surface_misfit, plastic_residual
