@@ -8,7 +8,7 @@ problem by fast sweeping, on a prescribed grounded-ice mask. Mode `"surface"`
 relief and no outer iteration. Modes `"flat"` and `"full"` solve for `w = H^2` (`"full"`
 with the bed-gradient correction by a damped fixed point and an optional warm start).
 With `plastic_solve_coulomb` the basal stress follows a Coulomb yield law,
-tau_b = mu N_eff(H) (Fortran only). Closures: Glen
+tau_b = mu N_eff(H) (in PlasticIceSheet.jl since v0.2.1). Closures: Glen
 deformation, linear / Weertman / regularized-Coulomb sliding, DIVA velocity, MFD balance
 flux and velocity, implied SMB, and the SMB-driven reconstruction (steady mass
 conservation solved directly by Newton; optional Lis and OpenMP).
