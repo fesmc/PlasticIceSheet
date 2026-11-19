@@ -17,7 +17,7 @@ yield law (`plastic_solve_coulomb`), the joint inversion of speed and mass balan
 `(nx,ny)`, `i = x`, `j = y`, as in Julia.
 
 ```fortran
-type(plastic_par_t)  :: par   ! rho_i=917, rho_w=1025, g=9.80665, H_min=1, mode="full"|"flat"|"surface",
+type(plastic_par_t)  :: par   ! rho_i=917, rho_w=1025, g=9.80665, H_min=1, mode="surface"|"flat"|"full",
                               ! max_sweeps=200, n_outer=100, tol=1e-6, outer_tol=1e-3, relax=0.5,
                               ! warm_frac_max=0.1, margin="face"|"centre", sweep="serial"|"wavefront"
 type(plastic_t)      :: ps    ! par, nx, ny, dx, dy, w=H^2, H, z_srf, tau_b, n_outer_used, converged,
@@ -85,7 +85,6 @@ Units: m, Pa, velocities in m/yr (per-year `A` and sliding coefficients), smb in
 
 Differences from Julia:
 
-- The default of `par%mode` is `"full"` (Julia: `:surface`).
 - Sea level `z_sl`, `tau_b` and `smb` are fields (Julia also takes scalars);
   `H_flt = (rho_w/rho_i) max(z_sl - z_bed, 0)`.
 - `plastic_smb_implied` takes the velocity vector; the flux magnitude is `hypot(ux,uy)`,
