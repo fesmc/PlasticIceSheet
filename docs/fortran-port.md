@@ -2,14 +2,15 @@
 
 A dependency-free Fortran library (`libplastic.a`) with the forward solver and the
 closures of [PlasticIceSheet.jl](https://github.com/fesmc/PlasticIceSheet.jl), for
-coupling into kryos as an ice backend. It matches PlasticIceSheet.jl v0.2.0 in the shared
+coupling into kryos as an ice backend. It matches PlasticIceSheet.jl v0.2.1 in the shared
 features: modes `"surface"`, `"flat"` and `"full"`, the margin position, sea level, the
-closures, the sliding coefficient per cell and the steady SMB-driven solver. Mode
+Coulomb yield law, the closures, the sliding coefficient per cell and the steady SMB-driven
+solver. Mode
 `"surface"` solves the plastic surface equation for z_s directly; it is the recommended
 mode for kryos (see [Mode "surface"](#mode-surface)). Not ported: the AD /
-implicit-differentiation extension and the tau_b inversion. Fortran only: the Coulomb
-yield law (`plastic_solve_coulomb`), the joint inversion of speed and mass balance
-(`plastic_smb_inversion`), the warm start of `"full"` and the parallel wavefront sweep.
+implicit-differentiation extension and the tau_b inversion. Fortran only: the joint
+inversion of speed and mass balance (`plastic_smb_inversion`), the warm start of `"full"`
+and the parallel wavefront sweep.
 
 ## API
 
