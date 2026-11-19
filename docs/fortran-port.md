@@ -2,10 +2,14 @@
 
 A dependency-free Fortran library (`libplastic.a`) with the forward solver and the
 closures of [PlasticIceSheet.jl](https://github.com/fesmc/PlasticIceSheet.jl), for
-coupling into kryos as an ice backend. Not ported: the AD / implicit-differentiation
-extension and the tau_b inversion. Added: mode `"surface"` (not in the Julia package),
-which solves the plastic surface equation for z_s directly; it is the recommended mode
-for kryos (see [Mode "surface"](#mode-surface)).
+coupling into kryos as an ice backend. It matches PlasticIceSheet.jl v0.2.0 in the shared
+features: modes `"surface"`, `"flat"` and `"full"`, the margin position, sea level, the
+closures, the sliding coefficient per cell and the steady SMB-driven solver. Mode
+`"surface"` solves the plastic surface equation for z_s directly; it is the recommended
+mode for kryos (see [Mode "surface"](#mode-surface)). Not ported: the AD /
+implicit-differentiation extension and the tau_b inversion. Fortran only: the Coulomb
+yield law (`plastic_solve_coulomb`), the joint inversion of speed and mass balance
+(`plastic_smb_inversion`), the warm start of `"full"` and the parallel wavefront sweep.
 
 ## API
 
@@ -44,7 +48,7 @@ type(plastic_sliding_t)  :: slide  ! law="linear"|"weertman"|"coulomb", beta, m,
 type(plastic_smb_ctrl_t) :: ctrl   ! method="steady"|"routing";
                                    ! steady: res_tol=1e-6 [m/yr], n_steady=500, dt0=1, dt_max=1e8 [yr],
                                    !   lin="auto"|"lis"|"builtin", lin_tol=1e-8, lin_maxit=2000, verbose;
-                                   ! routing: mode="surface"|"flat" (inner solve; "flat" = Julia),
+                                   ! routing: mode="surface"|"flat" (inner solve; Julia inner_mode),
                                    !   n_outer=1000, relax=0.05, tol=1.0, tau_hi=5e5, max_sweeps=400,
                                    !   sweep_tol=1e-9; both: tau_init=5e4 (cold start)
 call plastic_velocity(ps, tau_b, mask, rheo, slide, ux, uy [, speed, slope_eps, u_b, u_def, stat])
@@ -81,15 +85,16 @@ Units: m, Pa, velocities in m/yr (per-year `A` and sliding coefficients), smb in
 
 Differences from Julia:
 
-- Sea level is a field `z_sl(nx,ny)`: `H_flt = (rho_w/rho_i) max(z_sl - z_bed, 0)`.
-- `tau_b` and `smb` are fields (no scalar broadcast).
+- The default of `par%mode` is `"full"` (Julia: `:surface`).
+- Sea level `z_sl`, `tau_b` and `smb` are fields (Julia also takes scalars);
+  `H_flt = (rho_w/rho_i) max(z_sl - z_bed, 0)`.
 - `plastic_smb_implied` takes the velocity vector; the flux magnitude is `hypot(ux,uy)`,
   or `speed` when given. Passing the `speed` of `plastic_velocity` reproduces Julia's
   `smb_from_velocity` (which reads `vel.speed`) and makes the round trip with
   `plastic_balance_flux` exact.
 - "No upwind value" in the sweep is a finite sentinel (`1e300`) instead of `Inf`.
 - Ice cells in a region with no ice-free cell (unreachable by the sweep) get `H = 0`
-  and `stat = PLASTIC_NOT_CONVERGED` with a message (Julia returns `Inf`).
+  and `stat = PLASTIC_NOT_CONVERGED` with a message (Julia: `H = 0` and a warning).
 
 Status: nothing stops inside the library. `stat` (and `ps%stat`, `ps%msg`) is
 `PLASTIC_OK` (converged), `PLASTIC_NOT_CONVERGED` (result usable, tolerance not met)
@@ -128,9 +133,9 @@ Godunov update at (1 - margin_frac) dx (dy), with its margin value (z_b + H_flt,
 H_flt^2). The factor is floored at `MARGIN_DMIN` = 0.01, so a margin closer than 1 % of a
 cell to an ice-cell centre counts as at 1 %. Values outside [0, 1) on ice-free cells give
 `PLASTIC_BAD_INPUT`. Without `margin_frac`, `par%margin` sets one value: `"face"`
-(default, 0.5: margin at the cell face) or `"centre"` (0: at the ice-free cell centre,
-as PlasticIceSheet.jl). The rule applies to all modes and to `plastic_solve_smb`, and to
-the residual diagnostics.
+(default, 0.5: margin at the cell face, as PlasticIceSheet.jl v0.2) or `"centre"` (0: at
+the ice-free cell centre, as PlasticIceSheet.jl v0.1). The rule applies to all modes, to
+`plastic_solve_smb` and to the residual diagnostics.
 
 Signed-distance convention (kryos): `sdist(nx,ny)` [m] is the distance to the margin,
 positive in the ice and negative outside, at the cell centres.
@@ -314,7 +319,7 @@ bit-identical to before in every mode.
 `plastic_solve_smb` (Julia `diva_reconstruct`) iterates H -> T(H): route the SMB down
 z_s = z_b + H with the MFD weights (flux Q), invert the DIVA flux law per cell for tau_d,
 solve the plastic equation with tau_d (inner mode `ctrl%mode`, `"surface"` by default,
-`"flat"` as Julia), and under-relax, H <- H + r (T(H) - H). The `"surface"` inner solve
+`"flat"` as Julia v0.1), and under-relax, H <- H + r (T(H) - H). The `"surface"` inner solve
 does not make it converge. `compare/smb_diag.f90`, 2000 iterations at r = 0.05 from the
 cold start:
 
@@ -560,13 +565,18 @@ status reporting. All pass with ifx and gfortran, release and debug builds.
 
 ## Comparison with PlasticIceSheet.jl
 
+The comparison below was run against PlasticIceSheet.jl v0.1, before the Julia package
+took over mode `"surface"`, the margin position and the steady SMB-driven solver in v0.2.0.
+The v0.2.0 tests reproduce the Fortran Vialov errors of the steady solver (2.6, 1.1, 0.61
+and 0.32 % at 20, 10, 5 and 2.5 km).
+
 `compare/run.sh` (sbatch, Levante shared partition, one core) writes the inputs of each
 case from Julia (`compare/julia_ref.jl`), runs PlasticIceSheet.jl (1.12.6, after a JIT
 warm-up) and the Fortran driver (`compare/plastic_compare.f90`, ifx 2023.2, `-O3
 -march=core-avx2 -fp-model precise`) on them, and tabulates the differences over the ice
 mask (`compare/compare.jl`). Times are wall clock, best of 3 for flat/full, one run for
 the SMB-driven solve. All Fortran runs of the comparison use `par%margin = "centre"`
-(Julia's margin position), including the surface-mode results below.
+(Julia's margin position in v0.1), including the surface-mode results below.
 
 - `synth150`, `synth300`: synthetic cap (dx = 2 km, circular mask, 300 m bedrock high plus
   50 m undulations, tau_b = 1e5 Pa +- 30 %); full with relax = 0.4, n_outer = 200;
@@ -575,7 +585,7 @@ the SMB-driven solve. All Fortran runs of the comparison use `par%margin = "cent
   1961-1990 SMB), uniform tau_b = 1e5 Pa; full with relax = 0.4, n_outer = 500;
   SMB-driven with a regularized-Coulomb bed, C = rho_i g mean(H_obs), as
   `examples/reconstruct_greenland.jl`. Sea level 0. The Fortran SMB-driven runs use
-  `ctrl%mode = "flat"` (Julia's inner solve).
+  `ctrl%mode = "flat"` (Julia's inner solve of the routing method).
 
 | case | field | max H [m] | max abs dH [m] | rms dH [m] | t Julia [s] | t Fortran [s] | Julia / Fortran |
 |---|---|---|---|---|---|---|---|

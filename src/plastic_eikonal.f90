@@ -41,7 +41,7 @@ module plastic_eikonal
         real(dp) :: relax      = 0.5_dp     ! :full under-relaxation in (0,1]
         ! Margin position between an ice cell and an ice-free neighbour, without margin_frac:
         ! "face" (half way, margin_frac = 0.5) or "centre" (at the ice-free cell centre,
-        ! margin_frac = 0, as PlasticIceSheet.jl).
+        ! margin_frac = 0, as PlasticIceSheet.jl before v0.2).
         character(len=8) :: margin = "face"
         ! Sweep ordering: "serial" (row by row) or "wavefront" (the cells of each
         ! anti-diagonal in parallel with OpenMP; the same Gauss-Seidel dependencies, hence
