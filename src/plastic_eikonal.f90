@@ -33,7 +33,7 @@ module plastic_eikonal
         real(dp) :: rho_w  = 1025.0_dp      ! sea-water density [kg m-3]
         real(dp) :: g      = 9.80665_dp     ! gravity [m s-2]
         real(dp) :: H_min  = 1.0_dp         ! thickness floor in the :full RHS [m]
-        character(len=8) :: mode = "full"   ! "full" | "flat" | "surface"
+        character(len=8) :: mode = "surface"   ! "surface" | "flat" | "full"
         integer  :: max_sweeps = 200        ! inner fast-sweeping cap
         integer  :: n_outer    = 100        ! :full outer fixed-point cap
         real(dp) :: tol        = 1.0e-6_dp  ! inner early exit, on max decrease of w [m2] (z_s [m] in "surface")

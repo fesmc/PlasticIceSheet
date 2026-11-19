@@ -23,7 +23,7 @@ make check                            # tests
 use plastic_ice
 type(plastic_t) :: ps
 call plastic_init(ps, nx, ny, dx, dy)
-call plastic_solve(ps, z_bed, z_sl, tau_b, mask)   ! ps%par%mode = "surface" -> ps%H, ps%z_srf
+call plastic_solve(ps, z_bed, z_sl, tau_b, mask)   ! par%mode = "surface" (default) -> ps%H, ps%z_srf
 ```
 
 API, build, tests and the comparison with the Julia package: [docs/fortran-port.md](docs/fortran-port.md).
